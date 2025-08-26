@@ -1,0 +1,592 @@
+# -*- coding: utf-8 -*-
+# =========================================================
+# Dash Linkers — Outright / Spread / Fly + Regression
+# (NA-drop, lookback/reg-window clippés & fléchés, tenor
+#  déduit du nom du linker, titres explicites)
+# =========================================================
+import re
+import socket
+import webbrowser
+from typing import Optional, List, Tuple
+
+import numpy as np
+import pandas as pd
+
+import dash
+from dash import Dash, dcc, html, Input, Output, State, callback
+import plotly.graph_objects as go
+from dateutil.relativedelta import relativedelta
+
+# =========================================================
+# PRÉREQUIS dans ton scope Python :
+#   Linker_lists: Dict[str, List[str]]
+#   RY_dataframes, BE_dataframes, ZSPREAD_dataframes, Iota_dataframes:
+#       Dict[str, pd.DataFrame] (index datetime, colonnes = security descriptions exactes)
+#   data: pd.DataFrame avec colonnes "Country 2Y/3Y/5Y/7Y/10Y/15Y/20Y/25Y/30Y"
+# =========================================================
+
+# =========================
+# CONFIG
+# =========================
+COUNTRIES = ["Italy", "France", "BTPItaly", "Spain", "Germany"]
+TENORS = [2, 3, 5, 7, 10, 15, 20, 25, 30]
+MONTHS_MAP = {
+    "JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+    "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12
+}
+
+LOOKBACKS = {
+    "1m": relativedelta(months=1),
+    "2m": relativedelta(months=2),
+    "3m": relativedelta(months=3),
+    "6m": relativedelta(months=6),
+    "1Y": relativedelta(years=1),
+    "2Y": relativedelta(years=2),
+    "3Y": relativedelta(years=3),
+    "5Y": relativedelta(years=5),
+    "10Y": relativedelta(years=10),
+}
+
+REG_WINDOWS = {
+    "3M": relativedelta(months=3),
+    "6M": relativedelta(months=6),
+    "1Y": relativedelta(years=1),
+    "2Y": relativedelta(years=2),
+    "3Y": relativedelta(years=3),
+}
+
+# =========================
+# HELPERS — parsing tenor, séries, lookbacks
+# =========================
+def _today() -> pd.Timestamp:
+    # point d’ancrage “aujourd’hui” (index typique des df = dates de clôture)
+    return pd.Timestamp.today().normalize()
+
+def _years_between(a: pd.Timestamp, b: pd.Timestamp) -> float:
+    return float((b - a).days) / 365.25
+
+def infer_tenor_from_security_name(secname: str, asof: Optional[pd.Timestamp] = None) -> Optional[int]:
+    """
+    Essaie de déduire la maturité (en années) depuis le nom du linker :
+      - formats pris en charge: '11/34', '11/2034', 'Nov-34', 'Nov 2034', 'NOV34', 'NOV 34', '2034'
+      - pour un 'yy' ambigu, on mappe 00–79 -> 2000–2079, 80–99 -> 1980–1999 (convention raisonnable)
+    On calcule (MaturityDate - today) en années, puis on choisit le TENOR le plus proche.
+    """
+    if not secname:
+        return None
+    s = secname.upper()
+    asof = (asof or _today())
+
+    # 1) mm/yy or mm/yyyy e.g. '11/34' '11/2034'
+    m = re.search(r'\b(\d{1,2})\s*/\s*(\d{2,4})\b', s)
+    if m:
+        mm = int(m.group(1))
+        yy = int(m.group(2))
+        year = 2000 + yy if yy < 80 else (1900 + yy if yy < 100 else yy)
+        month = min(max(mm, 1), 12)
+        mat = pd.Timestamp(year=year, month=month, day=15)
+        yrs = _years_between(asof, mat)
+        return min(TENORS, key=lambda t: abs(t - yrs)) if yrs > 0 else min(TENORS, key=lambda t: abs(t - abs(yrs)))
+
+    # 2) 'NOV 2034' / 'NOV-34' / 'NOV34'
+    m = re.search(r'\b([A-Z]{3})[\s\-]*([0-9]{2,4})\b', s)
+    if m and m.group(1) in MONTHS_MAP:
+        month = MONTHS_MAP[m.group(1)]
+        yy = int(m.group(2))
+        year = 2000 + yy if yy < 80 else (1900 + yy if yy < 100 else yy)
+        mat = pd.Timestamp(year=year, month=month, day=15)
+        yrs = _years_between(asof, mat)
+        return min(TENORS, key=lambda t: abs(t - yrs)) if yrs > 0 else min(TENORS, key=lambda t: abs(t - abs(yrs)))
+
+    # 3) '2034' isolé
+    m = re.search(r'\b(19|20)\d{2}\b', s)
+    if m:
+        year = int(m.group(0))
+        mat = pd.Timestamp(year=year, month=6, day=15)
+        yrs = _years_between(asof, mat)
+        return min(TENORS, key=lambda t: abs(t - yrs)) if yrs > 0 else min(TENORS, key=lambda t: abs(t - abs(yrs)))
+
+    # 4) '34' isolé (dangereux, on évite)
+    return None
+
+def get_metric_dataframe(metric: str, country: Optional[str]) -> Optional[pd.DataFrame]:
+    if not country:
+        return None
+    if metric == "RY":
+        return RY_dataframes.get(country)
+    if metric == "BE":
+        return BE_dataframes.get(country)
+    if metric == "IOTA":
+        return Iota_dataframes.get(country)
+    if metric == "ZSPREAD":
+        return ZSPREAD_dataframes.get(country)
+    return None
+
+def get_linker_series(metric: str, country: Optional[str], linker: Optional[str]) -> Optional[pd.Series]:
+    df = get_metric_dataframe(metric, country)
+    if df is None or not linker or linker not in df.columns:
+        return None
+    s = pd.to_numeric(df[linker], errors="coerce").dropna()
+    s.name = f"{metric} | {country} | {linker}"
+    return s
+
+def align_inner(*series: Optional[pd.Series]) -> pd.DataFrame:
+    """Concat strict (inner) des séries non-nulles; colonnes s1,s2,s3 dans l’ordre d’entrée. Drop NA."""
+    cols, arr = [], []
+    for i, s in enumerate(series, start=1):
+        if isinstance(s, pd.Series) and not s.empty:
+            cols.append(f"s{i}")
+            arr.append(s.astype(float))
+    if not arr:
+        return pd.DataFrame()
+    df = pd.concat(arr, axis=1, join="inner").dropna()
+    df.columns = cols
+    return df
+
+def constructed_mode(c1, l1, c2, l2, c3, l3) -> str:
+    filled = [bool(c1 and l1), bool(c2 and l2), bool(c3 and l3)]
+    if filled[0] and filled[1] and not filled[2]:
+        return "spread"
+    if all(filled):
+        return "fly"
+    return "outright"
+
+def constructed_formula(mode: str, l1: Optional[str], l2: Optional[str], l3: Optional[str]) -> str:
+    if mode == "spread" and l1 and l2:
+        return f"{l1} − {l2}"
+    if mode == "fly" and l1 and l2 and l3:
+        return f"2×{l2} − {l1} − {l3}"
+    return f"{l1}" if l1 else "—"
+
+def _clip_series_by_lookback(s: pd.Series, lookback_key: str) -> Tuple[pd.Series, str]:
+    """
+    Drop NA, puis clip à la fenêtre demandée. Retourne (subseries, note)
+    La note précise si on a dû réduire (ex: demandé 5Y, dispo 3.2Y).
+    """
+    s = s.dropna().sort_index()
+    if s.empty:
+        return s, "Empty series after NA drop."
+    desired_delta = LOOKBACKS.get(lookback_key, relativedelta(years=10))
+    end = s.index.max()
+    start_req = end - desired_delta
+    start_avail = s.index.min()
+    # fenêtre réellement disponible
+    start_final = max(start_req, start_avail)
+    sub = s.loc[s.index >= start_final]
+
+    # calcul des années
+    desired_years = abs(_years_between(start_req, end))
+    avail_years = abs(_years_between(start_avail, end))
+    used_years = abs(_years_between(start_final, end))
+
+    note = f"Requested ≈ {desired_years:.1f}Y | Available ≈ {avail_years:.1f}Y → Using ≈ {used_years:.1f}Y"
+    return sub, note
+
+def credit_spread_series(country: str, tenor: int) -> Optional[pd.Series]:
+    """Spread (country – Germany) au tenor donné."""
+    col_c = f"{country} {tenor}Y"
+    col_g = f"Germany {tenor}Y"
+    if country == "Germany":
+        return None
+    if (col_c not in data.columns) or (col_g not in data.columns):
+        return None
+    s = pd.to_numeric(data[col_c], errors="coerce") - pd.to_numeric(data[col_g], errors="coerce")
+    return s.dropna().rename(f"CS {country}-DE {tenor}Y")
+
+def credit_spread_10y(country: str) -> Optional[pd.Series]:
+    """CS10Y(country) = Ctry 10Y − DE 10Y. Germany → 0 série si DE 10Y dispo."""
+    col_g = "Germany 10Y"
+    if col_g not in data.columns:
+        return None
+    if country == "Germany":
+        base = pd.to_numeric(data[col_g], errors="coerce").dropna()
+        return (base*0.0).rename("CS10Y Germany (0)")
+    col_c = f"{country} 10Y"
+    if col_c not in data.columns:
+        return None
+    s = pd.to_numeric(data[col_c], errors="coerce") - pd.to_numeric(data[col_g], errors="coerce")
+    return s.dropna().rename(f"CS10Y {country}-DE")
+
+def credit_spread_10y_diff(c1: str, c2: str) -> Optional[pd.Series]:
+    """[CS10Y(C1) − CS10Y(C2)] = C1 10Y − C2 10Y."""
+    col1, col2 = f"{c1} 10Y", f"{c2} 10Y"
+    if col1 not in data.columns or col2 not in data.columns:
+        return None
+    s = pd.to_numeric(data[col1], errors="coerce") - pd.to_numeric(data[col2], errors="coerce")
+    return s.dropna().rename(f"CS10Y diff ({c1}−{c2})")
+
+def scatter_with_fit(x: pd.Series, y: pd.Series, title: str, xlab: str, ylab: str) -> go.Figure:
+    X = x.values.astype(float); Y = y.values.astype(float)
+    mask = np.isfinite(X) & np.isfinite(Y)
+    X = X[mask]; Y = Y[mask]
+    fig = go.Figure()
+    fig.update_layout(title=title, template="plotly_white",
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    fig.update_layout(xaxis_title=xlab, yaxis_title=ylab)
+    if X.size < 2:
+        return fig
+    slope, intercept = np.polyfit(X, Y, 1)
+    line_x = np.linspace(X.min(), X.max(), 200)
+    line_y = slope * line_x + intercept
+    fig.add_trace(go.Scatter(x=X, y=Y, mode="markers", name="Obs", opacity=0.75))
+    fig.add_trace(go.Scatter(x=line_x, y=line_y, mode="lines", name=f"Fit y={slope:.3f}x+{intercept:.3f}",
+                             line=dict(color="black")))
+    return fig
+
+# =========================
+# APP
+# =========================
+app: Dash = dash.Dash(__name__, suppress_callback_exceptions=True)
+app.title = "Dash Linkers — Outright/Spreads/Flies"
+
+def country_dropdown(id_, placeholder):
+    return dcc.Dropdown(
+        id=id_,
+        options=[{"label": c, "value": c} for c in COUNTRIES],
+        placeholder=placeholder, clearable=True
+    )
+
+def linker_dropdown(id_):
+    return dcc.Dropdown(id=id_, options=[], placeholder="Choisis un linker", clearable=True)
+
+app.layout = html.Div([
+    html.H2("📈 Linkers Dashboard — Outright, Spreads & Flies"),
+    html.Div([
+        html.Div([
+            html.Label("Country 1"), country_dropdown("country1", "Sélectionne Country 1"),
+            html.Label("Linker 1"), linker_dropdown("linker1"),
+        ], style={"display": "inline-block", "minWidth": 280, "marginRight": "16px"}),
+
+        html.Div([
+            html.Label("Country 2 (optionnel — spread/fly)"), country_dropdown("country2", "Sélectionne Country 2"),
+            html.Label("Linker 2"), linker_dropdown("linker2"),
+        ], style={"display": "inline-block", "minWidth": 280, "marginRight": "16px"}),
+
+        html.Div([
+            html.Label("Country 3 (optionnel — fly)"), country_dropdown("country3", "Sélectionne Country 3"),
+            html.Label("Linker 3"), linker_dropdown("linker3"),
+        ], style={"display": "inline-block", "minWidth": 280}),
+    ], style={"marginBottom": "10px"}),
+
+    html.Div([
+        html.Label("Lookback"),
+        dcc.RadioItems(
+            id="lookback",
+            options=[{"label": k, "value": k} for k in LOOKBACKS.keys()],
+            value="1Y", inline=True
+        ),
+    ], style={"marginBottom": "8px"}),
+
+    # Bloc résumé de la série construite + zone notes
+    html.Div(id="constructed-summary", style={
+        "background":"#f5f7fb","border":"1px solid #e6e9f2","padding":"8px 12px",
+        "borderRadius":"8px","margin":"10px 0"
+    }),
+    html.Div(id="note-area", style={"color":"#555","fontSize":"12px","margin":"6px 0"}),
+
+    dcc.Store(id="reg_tick", data=0),
+
+    dcc.Tabs(id="section", value="RY", children=[
+        dcc.Tab(label="Real Yield", value="RY"),
+        dcc.Tab(label="Break-evens", value="BE"),
+        dcc.Tab(label="Iotas", value="IOTA"),
+        dcc.Tab(label="Regression", value="REG"),
+    ]),
+
+    html.Div(id="section-controls", style={"marginTop": "10px"}),
+
+    dcc.Loading(html.Div(id="plots-area", style={"marginTop": "12px"}), type="default")
+])
+
+# =========================
+# DROPDOWNS dépendants
+# =========================
+@callback(Output("linker1", "options"), Input("country1", "value"))
+def update_linker1_options(country1):
+    if country1 and country1 in Linker_lists:
+        return [{"label": l, "value": l} for l in Linker_lists[country1]]
+    return []
+
+@callback(Output("linker2", "options"), Input("country2", "value"))
+def update_linker2_options(country2):
+    if country2 and country2 in Linker_lists:
+        return [{"label": l, "value": l} for l in Linker_lists[country2]]
+    return []
+
+@callback(Output("linker3", "options"), Input("country3", "value"))
+def update_linker3_options(country3):
+    if country3 and country3 in Linker_lists:
+        return [{"label": l, "value": l} for l in Linker_lists[country3]]
+    return []
+
+# =========================
+# CONTROLES spécifiques à l’onglet
+# =========================
+@callback(Output("section-controls", "children"), Input("section", "value"))
+def render_section_controls(section):
+    if section == "REG":
+        return html.Div([
+            html.Label("Fenêtre de régression"),
+            dcc.RadioItems(
+                id="reg_window",
+                options=[{"label": k, "value": k} for k in REG_WINDOWS.keys()],
+                value="6M", inline=True
+            ),
+            html.Div([
+                html.Div("Règles de la régression :", style={"fontWeight": 600}),
+                html.Ul([
+                    html.Li("Outright : Iota(Linker1) ~ Credit spread tenor proche (Country1 − Germany)."),
+                    html.Li("Spread (2 pays) : (Iota1 − Iota2) ~ [CS10Y(C1) − CS10Y(C2)]."),
+                    html.Li("Fly (3 pays) : 2×Iota2 − Iota1 − Iota3 ~ CS10Y(Country2)."),
+                ], style={"margin": "6px 0 0 18px"})
+            ], style={"fontSize": 12, "opacity": 0.85, "marginTop": "6px"})
+        ])
+    return html.Div()
+
+# Bloc résumé de la série construite (au-dessus des tabs)
+@callback(
+    Output("constructed-summary", "children"),
+    Input("country1", "value"), Input("linker1", "value"),
+    Input("country2", "value"), Input("linker2", "value"),
+    Input("country3", "value"), Input("linker3", "value"),
+    Input("section", "value")
+)
+def update_constructed_summary(c1, l1, c2, l2, c3, l3, section):
+    mode = constructed_mode(c1, l1, c2, l2, c3, l3)
+    formula = constructed_formula(mode, l1, l2, l3)
+    title = dict(RY="Real Yield", BE="Break-evens", IOTA="Iotas", REG="Regression").get(section, "")
+    return html.Div([
+        html.Div("Constructed Series", style={"fontWeight":700, "marginBottom":"4px"}),
+        html.Pre(formula, style={"margin":"0","whiteSpace":"pre-wrap","fontFamily":"monospace"}),
+        html.Div(f"Mode: {mode.UPPER()}  |  Section: {title}", style={"fontSize":"12px","color":"#555","marginTop":"4px"})
+    ])
+
+# Petit "tick" pour rafraîchir la REG quand on change la fenêtre
+@callback(
+    Output("reg_tick", "data"),
+    Input("reg_window", "value"),
+    State("reg_tick", "data"),
+    prevent_initial_call=True
+)
+def bump_reg_tick(reg_val, tick):
+    try:
+        return int(tick or 0) + 1
+    except Exception:
+        return 1
+
+# =========================
+# NOTE AREA (lookback/reg-window messages)
+# =========================
+@callback(
+    Output("note-area", "children"),
+    Input("section", "value"),
+    Input("lookback", "value"),
+    Input("country1", "value"), Input("linker1", "value"),
+    Input("country2", "value"), Input("linker2", "value"),
+    Input("country3", "value"), Input("linker3", "value"),
+    Input("reg_tick", "data"),
+    State("reg_window", "value")
+)
+def update_note(section, lookback, c1, l1, c2, l2, c3, l3, _tick, reg_window):
+    mode = constructed_mode(c1, l1, c2, l2, c3, l3)
+    notes = []
+    if section in ("RY","BE","IOTA"):
+        # on va estimer la dispo de la série construite pour info
+        metric = section
+        s1 = get_linker_series(metric, c1, l1) if c1 and l1 else None
+        s2 = get_linker_series(metric, c2, l2) if c2 and l2 else None
+        s3 = get_linker_series(metric, c3, l3) if c3 and l3 else None
+        if mode == "outright" and s1 is not None and not s1.dropna().empty:
+            _, note = _clip_series_by_lookback(s1, lookback); notes.append(note)
+        elif mode == "spread":
+            df = align_inner(s1, s2)
+            if not df.empty and df.shape[1] >= 2:
+                _, note = _clip_series_by_lookback(df["s1"] - df["s2"], lookback); notes.append(note)
+        elif mode == "fly":
+            df = align_inner(s1, s2, s3)
+            if not df.empty and df.shape[1] >= 3:
+                _, note = _clip_series_by_lookback(2.0*df["s2"] - df["s1"] - df["s3"], lookback); notes.append(note)
+    elif section == "REG":
+        # message générique (la fenêtre exacte est montrée dans le titre/reg plot)
+        if reg_window in REG_WINDOWS:
+            lab = reg_window
+        else:
+            lab = "6M"
+        notes.append(f"Regression window requested: {lab} — auto-clipped to common data availability.")
+    return html.Ul([html.Li(n) for n in notes]) if notes else html.Div()
+
+# =========================
+# RENDU principal (plots)
+# =========================
+@callback(
+    Output("plots-area", "children"),
+    Input("section", "value"),
+    Input("lookback", "value"),
+    Input("country1", "value"),
+    Input("country2", "value"),
+    Input("country3", "value"),
+    Input("linker1", "value"),
+    Input("linker2", "value"),
+    Input("linker3", "value"),
+    Input("reg_tick", "data"),   # force refresh régres quand fenêtre change
+    State("reg_window", "value"),
+    prevent_initial_call=False
+)
+def render_plots(section, lookback, c1, c2, c3, l1, l2, l3, _tick, reg_window):
+    mode = constructed_mode(c1, l1, c2, l2, c3, l3)
+
+    # ===== Timeseries sections (RY/BE/IOTA) =====
+    if section in ("RY", "BE", "IOTA"):
+        metric = section
+        s1 = get_linker_series(metric, c1, l1) if c1 and l1 else None
+        s2 = get_linker_series(metric, c2, l2) if c2 and l2 else None
+        s3 = get_linker_series(metric, c3, l3) if c3 and l3 else None
+
+        if mode == "outright":
+            if s1 is None or s1.dropna().empty:
+                return html.Div("Sélection incomplète ou données introuvables.", style={"color":"crimson"})
+            series, _ = _clip_series_by_lookback(s1, lookback)
+            title = f"{metric} — {l1}"
+            subtitle = f"Outright: {l1}"
+
+        elif mode == "spread":
+            df = align_inner(s1, s2)
+            if df.empty or df.shape[1] < 2:
+                return html.Div("Données insuffisantes pour le spread.", style={"color":"crimson"})
+            series, _ = _clip_series_by_lookback(df["s1"] - df["s2"], lookback)
+            title = f"{metric} — {l1} − {l2}"
+            subtitle = f"Spread: {l1} − {l2}"
+
+        else:  # fly
+            df = align_inner(s1, s2, s3)
+            if df.empty or df.shape[1] < 3:
+                return html.Div("Données insuffisantes pour le fly.", style={"color":"crimson"})
+            series, _ = _clip_series_by_lookback(2.0*df["s2"] - df["s1"] - df["s3"], lookback)
+            title = f"{metric} — 2×{l2} − {l1} − {l3}"
+            subtitle = f"Fly: 2×{l2} − {l1} − {l3}"
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=series.index, y=series.values, mode="lines", name=subtitle))
+        fig.update_layout(
+            title=title,
+            xaxis_title="Date",
+            yaxis_title=metric,
+            template="plotly_white",
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        return dcc.Graph(figure=fig)
+
+    # ===== Regression section =====
+    if section == "REG":
+        win = REG_WINDOWS.get(reg_window or "6M", REG_WINDOWS["6M"])
+
+        def regress_and_plot(x_raw: pd.Series, y_raw: pd.Series, title_prefix: str, xlab: str, ylab: str):
+            # drop NA + align + clip fenêtre demandée (sur l'intersection)
+            x = x_raw.dropna(); y = y_raw.dropna()
+            join = pd.concat([x.rename("x"), y.rename("y")], axis=1, join="inner").dropna().sort_index()
+            if join.empty:
+                return html.Div("Pas assez d’observations communes pour la régression.", style={"color": "crimson"})
+
+            end = join.index.max()
+            start_req = end - win
+            start_avail = join.index.min()
+            start_final = max(start_req, start_avail)
+            sub = join.loc[join.index >= start_final]
+            if len(sub) < 3:
+                return html.Div("Fenêtre trop courte après alignement.", style={"color": "crimson"})
+
+            # message de clipping dans le titre
+            desired_years = abs(_years_between(start_req, end))
+            avail_years = abs(_years_between(start_avail, end))
+            used_years = abs(_years_between(start_final, end))
+            title = f"{title_prefix} — requested≈{desired_years:.1f}Y | available≈{avail_years:.1f}Y → using≈{used_years:.1f}Y"
+
+            fig = scatter_with_fit(sub["x"], sub["y"], title, xlab, ylab)
+
+            X = sub["x"].values; Y = sub["y"].values
+            mask = np.isfinite(X) & np.isfinite(Y)
+            stats = html.Div()
+            if mask.sum() >= 2:
+                slope, intercept = np.polyfit(X[mask], Y[mask], 1)
+                corr = np.corrcoef(X[mask], Y[mask])[0,1]
+                stats = html.Div([
+                    html.Div(f"Observations: {int(mask.sum())}"),
+                    html.Div(f"Slope (beta): {slope:.3f}"),
+                    html.Div(f"Intercept: {intercept:.3f}"),
+                    html.Div(f"Corr: {corr:.3f}"),
+                ], style={"marginTop":"8px","fontSize":13,"opacity":0.85})
+            return html.Div([dcc.Graph(figure=fig), stats])
+
+        if mode == "outright":
+            if not (c1 and l1):
+                return html.Div("Choisis au minimum Country 1 et Linker 1.", style={"color": "crimson"})
+            if c1 == "Germany":
+                return html.Div("Pas de régression outright pour Germany (pas de spread vs Germany).", style={"color":"crimson"})
+            iota1 = get_linker_series("IOTA", c1, l1)
+            if iota1 is None or iota1.dropna().empty:
+                return html.Div("Iota introuvable pour ce linker.", style={"color":"crimson"})
+            tenor = infer_tenor_from_security_name(l1, asof=_today())
+            if tenor is None:
+                return html.Div("Impossible d’inférer le tenor depuis le nom du linker.", style={"color":"crimson"})
+            cs = credit_spread_series(c1, tenor)
+            if cs is None or cs.dropna().empty:
+                return html.Div("Série de credit spread indisponible.", style={"color":"crimson"})
+            title_prefix = f"REG (OUTRIGHT) — Iota({l1})  ~  CS {c1}-DE ({tenor}Y)"
+            return regress_and_plot(cs, iota1, title_prefix, xlab=f"CS {c1}-DE ({tenor}Y)", ylab=f"Iota({l1})")
+
+        if mode == "spread":
+            i1 = get_linker_series("IOTA", c1, l1)
+            i2 = get_linker_series("IOTA", c2, l2)
+            df = align_inner(i1, i2)
+            if df.empty or df.shape[1] < 2:
+                return html.Div("Iotas introuvables / pas d’overlap pour le spread.", style={"color":"crimson"})
+            box = (df["s1"] - df["s2"]).rename(f"IotaBox({l1}−{l2})")
+            cs_diff = credit_spread_10y_diff(c1, c2)
+            if cs_diff is None or cs_diff.dropna().empty:
+                return html.Div("Credit spread 10Y différentiel indisponible.", style={"color":"crimson"})
+            title_prefix = f"REG (SPREAD) — IotaBox({l1} − {l2})  ~  CS10Y({c1}) − CS10Y({c2})"
+            return regress_and_plot(cs_diff, box, title_prefix, xlab=f"CS10Y diff ({c1} − {c2})", ylab=f"IotaBox({l1}−{l2})")
+
+        # fly
+        i1 = get_linker_series("IOTA", c1, l1)
+        i2 = get_linker_series("IOTA", c2, l2)
+        i3 = get_linker_series("IOTA", c3, l3)
+        df = align_inner(i1, i2, i3)
+        if df.empty or df.shape[1] < 3:
+            return html.Div("Iotas introuvables / pas d’overlap pour le fly.", style={"color":"crimson"})
+        fly = (2.0*df["s2"] - df["s1"] - df["s3"]).rename(f"IotaFly(2×{l2}−{l1}−{l3})")
+        cs_c2 = credit_spread_10y(c2)
+        if cs_c2 is None or cs_c2.dropna().empty:
+            return html.Div("Credit spread 10Y (Country2) indisponible.", style={"color":"crimson"})
+        title_prefix = f"REG (FLY) — IotaFly(2×{l2} − {l1} − {l3})  ~  CS10Y({c2})"
+        return regress_and_plot(cs_c2, fly, title_prefix, xlab=f"CS10Y {c2}-DE", ylab=f"IotaFly(2×{l2}−{l1}−{l3})")
+
+    return html.Div()
+
+# =========================
+# MAIN — lancement
+# =========================
+def _get_local_ip() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+if __name__ == "__main__":
+    host, port = "0.0.0.0", 8057
+    local_ip = _get_local_ip()
+    print("\n================= SHARE THIS =================")
+    print(f"Local (toi)    : http://localhost:{port}")
+    print(f"Réseau (équipe): http://{local_ip}:{port}")
+    print("================================================\n")
+    try:
+        webbrowser.open(f"http://localhost:{port}")
+    except Exception:
+        pass
+    app.run_server(host=host, port=port, debug=False)
