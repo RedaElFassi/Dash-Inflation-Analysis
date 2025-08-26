@@ -1,0 +1,504 @@
+# -*- coding: utf-8 -*-
+# =========================================================
+# Dash Linkers — Outright / Spread / Fly + Regression
+# =========================================================
+import re
+import socket
+import webbrowser
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+import dash
+from dash import Dash, dcc, html, Input, Output, State, callback
+import plotly.graph_objects as go
+from dateutil.relativedelta import relativedelta
+
+# =========================
+# PRÉREQUIS — objets globaux déjà définis dans ton environnement :
+#   Linker_lists: Dict[str, List[str]]
+#   NOM_Eq_lists: Dict[str, List[str]]  # aligné 1:1 avec Linker_lists[pays]
+#   RY_dataframes, BE_dataframes, ZSPREAD_dataframes, Iota_dataframes:
+#       Dict[str, pd.DataFrame] (index=dates, colonnes=noms de linkers)
+#   data: pd.DataFrame avec colonnes "Country 2Y/3Y/5Y/7Y/10Y/15Y/20Y/25Y/30Y"
+# =========================
+
+# =========================
+# CONFIG
+# =========================
+COUNTRIES = ["Italy", "France", "BTPItaly", "Spain", "Germany"]
+TENORS = [2, 3, 5, 7, 10, 15, 20, 25, 30]
+TENOR_LABELS = [f"{t}Y" for t in TENORS]
+
+LOOKBACKS = {
+    "1m": relativedelta(months=1),
+    "2m": relativedelta(months=2),
+    "3m": relativedelta(months=3),
+    "6m": relativedelta(months=6),
+    "1Y": relativedelta(years=1),
+    "2Y": relativedelta(years=2),
+    "3Y": relativedelta(years=3),
+    "5Y": relativedelta(years=5),
+    "10Y": relativedelta(years=10),
+}
+
+REG_WINDOWS = {
+    "3M": relativedelta(months=3),
+    "6M": relativedelta(months=6),
+    "1Y": relativedelta(years=1),
+    "2Y": relativedelta(years=2),
+    "3Y": relativedelta(years=3),
+}
+
+# =========================
+# HELPERS — séries & math
+# =========================
+def nearest_tenor_from_nominal_equiv(nominal_equiv: Optional[str]) -> Optional[int]:
+    """
+    Extrait un integer (années) depuis une chaîne contenant un motif du type '10Y' / '10y'.
+    Puis choisit le tenor disponible le plus proche dans TENORS.
+    """
+    if not nominal_equiv:
+        return None
+    m = re.search(r'(\d+)\s*[Yy]\b', str(nominal_equiv))
+    if not m:
+        return None
+    val = int(m.group(1))
+    return min(TENORS, key=lambda t: abs(t - val))
+
+def get_metric_dataframe(metric: str, country: Optional[str]) -> Optional[pd.DataFrame]:
+    if not country:
+        return None
+    if metric == "RY":
+        return RY_dataframes.get(country)
+    if metric == "BE":
+        return BE_dataframes.get(country)
+    if metric == "IOTA":
+        return Iota_dataframes.get(country)
+    if metric == "ZSPREAD":
+        return ZSPREAD_dataframes.get(country)
+    return None
+
+def get_linker_series(metric: str, country: Optional[str], linker: Optional[str]) -> Optional[pd.Series]:
+    df = get_metric_dataframe(metric, country)
+    if df is None or not linker or linker not in df.columns:
+        return None
+    s = pd.to_numeric(df[linker], errors="coerce")
+    s.name = f"{metric} | {country} | {linker}"
+    return s
+
+def slice_lookback(series: pd.Series, lookback_key: str) -> pd.Series:
+    if series is None or series.empty:
+        return pd.Series(dtype=float)
+    end = series.dropna().index.max()
+    if pd.isna(end):
+        return pd.Series(dtype=float)
+    start = end - LOOKBACKS.get(lookback_key, relativedelta(years=10))
+    return series.loc[series.index >= start]
+
+def intersect_on_common_index(*series_list: Optional[pd.Series]) -> List[pd.Series]:
+    valid = [s.dropna() for s in series_list if isinstance(s, pd.Series) and not s.empty]
+    if not valid:
+        return []
+    common = valid[0].index
+    for s in valid[1:]:
+        common = common.intersection(s.index)
+    return [s.loc[common] for s in valid]
+
+def combine_series(mode: str, s1: Optional[pd.Series], s2: Optional[pd.Series], s3: Optional[pd.Series]) -> pd.Series:
+    if mode == "outright" and s1 is not None:
+        return s1
+    if mode == "spread" and s1 is not None and s2 is not None:
+        return s1 - s2
+    if mode == "fly" and all(s is not None for s in (s1, s2, s3)):
+        return 2.0 * s2 - s1 - s3
+    return pd.Series(dtype=float)
+
+def credit_spread_series(country: str, tenor: int) -> Optional[pd.Series]:
+    """Spread (country – Germany) au tenor donné (en niveaux, même unité que `data`)."""
+    col_c = f"{country} {tenor}Y"
+    col_g = f"Germany {tenor}Y"
+    if country == "Germany":
+        return None
+    if (col_c not in data.columns) or (col_g not in data.columns):
+        return None
+    s = pd.to_numeric(data[col_c], errors="coerce") - pd.to_numeric(data[col_g], errors="coerce")
+    s.name = f"CS {country} vs Germany ({tenor}Y)"
+    return s
+
+def credit_spread_10y(country: str) -> Optional[pd.Series]:
+    """CS10Y(country) = country 10Y − Germany 10Y. Pour Germany: renvoie série nulle si Germany 10Y dispo."""
+    col_g = "Germany 10Y"
+    if col_g not in data.columns:
+        return None
+    if country == "Germany":
+        base = pd.to_numeric(data[col_g], errors="coerce")
+        s = base * 0.0
+        s.name = "CS10Y Germany (0)"
+        return s
+    col_c = f"{country} 10Y"
+    if col_c not in data.columns:
+        return None
+    s = pd.to_numeric(data[col_c], errors="coerce") - pd.to_numeric(data[col_g], errors="coerce")
+    s.name = f"CS10Y {country}-Germany"
+    return s
+
+def credit_spread_10y_diff(c1: str, c2: str) -> Optional[pd.Series]:
+    """[CS10Y(C1) − CS10Y(C2)] = (C1 10Y − DE 10Y) − (C2 10Y − DE 10Y) = C1 10Y − C2 10Y."""
+    col1, col2 = f"{c1} 10Y", f"{c2} 10Y"
+    if col1 not in data.columns or col2 not in data.columns:
+        return None
+    s = pd.to_numeric(data[col1], errors="coerce") - pd.to_numeric(data[col2], errors="coerce")
+    s.name = f"CS10Y diff ({c1} − {c2})"
+    return s
+
+def scatter_with_fit(x: pd.Series, y: pd.Series, title: str, xlab: str, ylab: str) -> go.Figure:
+    X = x.values.astype(float)
+    Y = y.values.astype(float)
+    mask = np.isfinite(X) & np.isfinite(Y)
+    X = X[mask]; Y = Y[mask]
+    fig = go.Figure()
+    fig.update_layout(title=title, template="plotly_white",
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    if X.size < 2:
+        fig.update_layout(xaxis_title=xlab, yaxis_title=ylab)
+        return fig
+    slope, intercept = np.polyfit(X, Y, 1)
+    line_x = np.linspace(X.min(), X.max(), 200)
+    line_y = slope * line_x + intercept
+    fig.add_trace(go.Scatter(x=X, y=Y, mode="markers", name="Obs", opacity=0.75))
+    fig.add_trace(go.Scatter(x=line_x, y=line_y, mode="lines", name=f"Fit y={slope:.3f}x+{intercept:.3f}",
+                             line=dict(color="black")))
+    fig.update_layout(xaxis_title=xlab, yaxis_title=ylab)
+    return fig
+
+# =========================
+# APP
+# =========================
+app: Dash = dash.Dash(__name__, suppress_callback_exceptions=True)
+app.title = "Dash Linkers — Outright/Spreads/Flies"
+
+def country_dropdown(id_, placeholder):
+    return dcc.Dropdown(
+        id=id_,
+        options=[{"label": c, "value": c} for c in COUNTRIES],
+        placeholder=placeholder, clearable=True
+    )
+
+def linker_dropdown(id_):
+    return dcc.Dropdown(id=id_, options=[], placeholder="Choisis un linker", clearable=True)
+
+app.layout = html.Div([
+    html.H2("📈 Linkers Dashboard — Outright, Spreads & Flies"),
+    html.Div([
+        html.Div([
+            html.Label("Country 1"), country_dropdown("country1", "Sélectionne Country 1"),
+            html.Label("Linker 1"), linker_dropdown("linker1"),
+        ], style={"display": "inline-block", "minWidth": 280, "marginRight": "16px"}),
+
+        html.Div([
+            html.Label("Country 2 (optionnel — spread/fly)"), country_dropdown("country2", "Sélectionne Country 2"),
+            html.Label("Linker 2"), linker_dropdown("linker2"),
+        ], style={"display": "inline-block", "minWidth": 280, "marginRight": "16px"}),
+
+        html.Div([
+            html.Label("Country 3 (optionnel — fly)"), country_dropdown("country3", "Sélectionne Country 3"),
+            html.Label("Linker 3"), linker_dropdown("linker3"),
+        ], style={"display": "inline-block", "minWidth": 280}),
+    ], style={"marginBottom": "10px"}),
+
+    html.Div([
+        html.Label("Lookback"),
+        dcc.RadioItems(
+            id="lookback",
+            options=[{"label": k, "value": k} for k in LOOKBACKS.keys()],
+            value="1Y", inline=True
+        ),
+    ], style={"marginBottom": "8px"}),
+
+    dcc.Tabs(id="section", value="RY", children=[
+        dcc.Tab(label="Real Yield", value="RY"),
+        dcc.Tab(label="Break-evens", value="BE"),
+        dcc.Tab(label="Iotas", value="IOTA"),
+        dcc.Tab(label="Regression", value="REG"),
+    ]),
+
+    html.Div(id="section-controls", style={"marginTop": "10px"}),
+
+    dcc.Loading(html.Div(id="plots-area", style={"marginTop": "12px"}), type="default")
+])
+
+# =========================
+# DROPDOWNS dépendants
+# =========================
+@callback(Output("linker1", "options"), Input("country1", "value"))
+def update_linker1_options(country1):
+    if country1 and country1 in Linker_lists:
+        return [{"label": l, "value": l} for l in Linker_lists[country1]]
+    return []
+
+@callback(Output("linker2", "options"), Input("country2", "value"))
+def update_linker2_options(country2):
+    if country2 and country2 in Linker_lists:
+        return [{"label": l, "value": l} for l in Linker_lists[country2]]
+    return []
+
+@callback(Output("linker3", "options"), Input("country3", "value"))
+def update_linker3_options(country3):
+    if country3 and country3 in Linker_lists:
+        return [{"label": l, "value": l} for l in Linker_lists[country3]]
+    return []
+
+# =========================
+# CONTROLES spécifiques à l’onglet
+# =========================
+@callback(Output("section-controls", "children"), Input("section", "value"))
+def render_section_controls(section):
+    if section == "REG":
+        return html.Div([
+            html.Label("Fenêtre de régression"),
+            dcc.RadioItems(
+                id="reg_window",
+                options=[{"label": k, "value": k} for k in REG_WINDOWS.keys()],
+                value="6M", inline=True
+            ),
+            html.Div([
+                html.Div("Règles de la régression :", style={"fontWeight": 600}),
+                html.Ul([
+                    html.Li("Outright : Iota(Linker1) ~ Credit spread tenor proche (Country1 − Germany)."),
+                    html.Li("Spread (2 pays) : (Iota1 − Iota2) ~ [CS10Y(C1) − CS10Y(C2)]."),
+                    html.Li("Fly (3 pays) : 2×Iota2 − Iota1 − Iota3 ~ CS10Y(Country2)."),
+                ], style={"margin": "6px 0 0 18px"})
+            ], style={"fontSize": 12, "opacity": 0.85, "marginTop": "6px"})
+        ])
+    return html.Div()
+
+# =========================
+# RENDU principal (plots)
+# =========================
+@callback(
+    Output("plots-area", "children"),
+    Input("section", "value"),
+    Input("lookback", "value"),
+    Input("country1", "value"),
+    Input("country2", "value"),
+    Input("country3", "value"),
+    Input("linker1", "value"),
+    Input("linker2", "value"),
+    Input("linker3", "value"),
+    State("reg_window", "value"),
+    prevent_initial_call=False
+)
+def render_plots(section, lookback, c1, c2, c3, l1, l2, l3, reg_window):
+    filled = [bool(c1 and l1), bool(c2 and l2), bool(c3 and l3)]
+    mode = "outright"
+    if filled[0] and filled[1] and not filled[2]:
+        mode = "spread"
+    elif all(filled):
+        mode = "fly"
+
+    # ===== Timeseries sections (RY/BE/IOTA) =====
+    if section in ("RY", "BE", "IOTA"):
+        metric = section
+        s1 = get_linker_series(metric, c1, l1) if filled[0] else None
+        s2 = get_linker_series(metric, c2, l2) if filled[1] else None
+        s3 = get_linker_series(metric, c3, l3) if filled[2] else None
+
+        aligned = intersect_on_common_index(*(x for x in [s1, s2, s3] if x is not None))
+        if not aligned:
+            return html.Div("Sélection incomplète ou données introuvables pour ce choix.", style={"color": "crimson"})
+
+        # reconstruire s1/s2/s3 alignés dans l’ordre
+        idx = 0
+        s1a = aligned[idx] if filled[0] else None; idx += 1 if filled[0] else 0
+        s2a = aligned[idx] if filled[1] else None; idx += 1 if filled[1] else 0
+        s3a = aligned[idx] if filled[2] else None
+
+        combined = combine_series(mode, s1a, s2a, s3a)
+        combined = slice_lookback(combined, lookback)
+
+        title = {
+            "outright": f"{metric}: {c1} — {l1}",
+            "spread":   f"{metric}: ({c1} {l1}) − ({c2} {l2})",
+            "fly":      f"{metric}: 2×({c2} {l2}) − ({c1} {l1}) − ({c3} {l3})",
+        }[mode]
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=combined.index, y=combined.values, mode="lines", name=title))
+        fig.update_layout(title=title, xaxis_title="Date", yaxis_title=metric, template="plotly_white",
+                          hovermode="x unified")
+        return dcc.Graph(figure=fig)
+
+    # ===== Regression section =====
+    if section == "REG":
+        # déterminer le mode à partir des entrées
+        if mode == "outright":
+            if not (c1 and l1):
+                return html.Div("Choisis au minimum Country 1 et Linker 1.", style={"color": "crimson"})
+            iota_1 = get_linker_series("IOTA", c1, l1)
+            if iota_1 is None or iota_1.empty:
+                return html.Div("Iota introuvable pour ce linker.", style={"color": "crimson"})
+
+            # Tenor le plus proche via NOM_Eq_lists
+            tenor = None
+            try:
+                linkers = Linker_lists.get(c1, [])
+                noms = NOM_Eq_lists.get(c1, [])
+                idx = linkers.index(l1)
+                nominal_equiv = noms[idx] if 0 <= idx < len(noms) else None
+                tenor = nearest_tenor_from_nominal_equiv(nominal_equiv)
+            except Exception:
+                tenor = None
+
+            if c1 == "Germany":
+                return html.Div("Pas de régression pour Germany en outright (pas de spread vs Germany).",
+                                style={"color": "crimson"})
+            if tenor is None:
+                return html.Div("Impossible d’inférer le tenor depuis le nominal équivalent.",
+                                style={"color": "crimson"})
+
+            x_cs = credit_spread_series(c1, tenor)
+            if x_cs is None or x_cs.empty:
+                return html.Div("Série de credit spread indisponible.", style={"color": "crimson"})
+
+            # fenêtre de régression
+            end = min(iota_1.dropna().index.max(), x_cs.dropna().index.max())
+            win = REG_WINDOWS.get(reg_window or "6M", REG_WINDOWS["6M"])
+            start = end - win
+            x = x_cs.loc[x_cs.index >= start].dropna()
+            y = iota_1.loc[iota_1.index >= start].dropna()
+            xx, yy = intersect_on_common_index(x, y)
+            if len(xx) < 1 or len(yy) < 2:
+                return html.Div("Pas assez d’observations communes pour la régression.", style={"color": "crimson"})
+            x_final = xx[0]; y_final = yy[1]
+
+            fig = scatter_with_fit(x_final, y_final,
+                                   title=f"Regression (OUTRIGHT) — last {reg_window or '6M'}",
+                                   xlab=f"Credit spread {c1} vs Germany ({tenor}Y)", ylab="Iota")
+            # Stats
+            mask = np.isfinite(x_final.values) & np.isfinite(y_final.values)
+            stats = html.Div()
+            if mask.sum() >= 2:
+                slope, intercept = np.polyfit(x_final.values[mask], y_final.values[mask], 1)
+                corr = np.corrcoef(x_final.values[mask], y_final.values[mask])[0, 1]
+                stats = html.Div([
+                    html.Div(f"Observations: {int(mask.sum())}"),
+                    html.Div(f"Slope (beta): {slope:.3f}"),
+                    html.Div(f"Intercept: {intercept:.3f}"),
+                    html.Div(f"Corr: {corr:.3f}"),
+                ], style={"marginTop": "8px", "fontSize": 13, "opacity": 0.85})
+
+            return html.Div([dcc.Graph(figure=fig), stats])
+
+        elif mode == "spread":
+            # Iota box = Iota1 − Iota2
+            i1 = get_linker_series("IOTA", c1, l1)
+            i2 = get_linker_series("IOTA", c2, l2)
+            aligned = intersect_on_common_index(i1, i2)
+            if len(aligned) < 2:
+                return html.Div("Iotas introuvables / pas d’overlap pour le spread.", style={"color": "crimson"})
+            box = aligned[0] - aligned[1]
+
+            # X = CS10Y diff = CS10Y(C1) − CS10Y(C2) = C1 10Y − C2 10Y
+            x_cs = credit_spread_10y_diff(c1, c2)
+            if x_cs is None or x_cs.empty:
+                return html.Div("Credit spread 10Y différentiel indisponible.", style={"color": "crimson"})
+
+            # fenêtre
+            end = min(box.dropna().index.max(), x_cs.dropna().index.max())
+            win = REG_WINDOWS.get(reg_window or "6M", REG_WINDOWS["6M"])
+            start = end - win
+            x = x_cs.loc[x_cs.index >= start].dropna()
+            y = box.loc[box.index >= start].dropna()
+            xx, yy = intersect_on_common_index(x, y)
+            if len(xx) < 1 or len(yy) < 2:
+                return html.Div("Pas assez d’observations communes pour la régression.", style={"color": "crimson"})
+            x_final = xx[0]; y_final = yy[1]
+
+            fig = scatter_with_fit(x_final, y_final,
+                                   title=f"Regression (SPREAD) — last {reg_window or '6M'}",
+                                   xlab=f"Credit spread 10Y diff ({c1} − {c2})", ylab="Iota box")
+            mask = np.isfinite(x_final.values) & np.isfinite(y_final.values)
+            stats = html.Div()
+            if mask.sum() >= 2:
+                slope, intercept = np.polyfit(x_final.values[mask], y_final.values[mask], 1)
+                corr = np.corrcoef(x_final.values[mask], y_final.values[mask])[0, 1]
+                stats = html.Div([
+                    html.Div(f"Observations: {int(mask.sum())}"),
+                    html.Div(f"Slope (beta): {slope:.3f}"),
+                    html.Div(f"Intercept: {intercept:.3f}"),
+                    html.Div(f"Corr: {corr:.3f}"),
+                ], style={"marginTop": "8px", "fontSize": 13, "opacity": 0.85})
+            return html.Div([dcc.Graph(figure=fig), stats])
+
+        else:  # mode == "fly"
+            # Iota fly = 2×Iota2 − Iota1 − Iota3
+            i1 = get_linker_series("IOTA", c1, l1)
+            i2 = get_linker_series("IOTA", c2, l2)
+            i3 = get_linker_series("IOTA", c3, l3)
+            aligned = intersect_on_common_index(i1, i2, i3)
+            if len(aligned) < 3:
+                return html.Div("Iotas introuvables / pas d’overlap pour le fly.", style={"color": "crimson"})
+            i1a, i2a, i3a = aligned
+            fly = 2.0 * i2a - i1a - i3a
+
+            # X = CS10Y du pays central (Country2)
+            x_cs = credit_spread_10y(c2)
+            if x_cs is None or x_cs.empty:
+                return html.Div("Credit spread 10Y (Country2) indisponible.", style={"color": "crimson"})
+
+            end = min(fly.dropna().index.max(), x_cs.dropna().index.max())
+            win = REG_WINDOWS.get(reg_window or "6M", REG_WINDOWS["6M"])
+            start = end - win
+            x = x_cs.loc[x_cs.index >= start].dropna()
+            y = fly.loc[fly.index >= start].dropna()
+            xx, yy = intersect_on_common_index(x, y)
+            if len(xx) < 1 or len(yy) < 2:
+                return html.Div("Pas assez d’observations communes pour la régression.", style={"color": "crimson"})
+            x_final = xx[0]; y_final = yy[1]
+
+            fig = scatter_with_fit(x_final, y_final,
+                                   title=f"Regression (FLY) — last {reg_window or '6M'}",
+                                   xlab=f"Credit spread 10Y {c2} vs Germany", ylab="Iota fly")
+            mask = np.isfinite(x_final.values) & np.isfinite(y_final.values)
+            stats = html.Div()
+            if mask.sum() >= 2:
+                slope, intercept = np.polyfit(x_final.values[mask], y_final.values[mask], 1)
+                corr = np.corrcoef(x_final.values[mask], y_final.values[mask])[0, 1]
+                stats = html.Div([
+                    html.Div(f"Observations: {int(mask.sum())}"),
+                    html.Div(f"Slope (beta): {slope:.3f}"),
+                    html.Div(f"Intercept: {intercept:.3f}"),
+                    html.Div(f"Corr: {corr:.3f}"),
+                ], style={"marginTop": "8px", "fontSize": 13, "opacity": 0.85})
+            return html.Div([dcc.Graph(figure=fig), stats])
+
+    return html.Div()
+
+# =========================
+# MAIN — lancement (style “inspiré”)
+# =========================
+def _get_local_ip() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+if __name__ == "__main__":
+    host, port = "0.0.0.0", 8057  # tu peux changer le port
+    local_ip = _get_local_ip()
+    print("\n================= SHARE THIS =================")
+    print(f"Local (toi)    : http://localhost:{port}")
+    print(f"Réseau (équipe): http://{local_ip}:{port}")
+    print("================================================\n")
+    try:
+        webbrowser.open(f"http://localhost:{port}")
+    except Exception:
+        pass
+    app.run_server(host=host, port=port, debug=False)
