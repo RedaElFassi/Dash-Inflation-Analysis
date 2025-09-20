@@ -8,11 +8,9 @@
 # - Regression: last point highlighted; user can pick C1/C2 & tenor
 # - Red "Not enough data" flag on ALL tabs
 # - Regression stats: Observations, Beta, Intercept, R², Corr
-# - Per-country tables (after graphs in RY/BE/Iota): last levels + Sharpe z-scores (6M)
-#   + percentiles (6M) + daily vol (bps, 6M) — Iota vol fixed (no ×100)
-# - Components time-series on RY/BE/Iota; Regression residuals + dual-axis components
-#   (Iota LEFT axis, Credit spread RIGHT axis)
-# - Page-level horizontal scrolling (graphs remain full-size & centered)
+# - Per-country tables (after graphs in RY/BE/Iota): last levels + Sharpe z-scores (6M) + percentiles (6M) + daily vol (bps, 6M)
+# - Components time-series on RY/BE/Iota; Regression residuals + dual-axis components (Iota LEFT, Spread RIGHT)
+# - Page-level horizontal scrolling kept (for wide tables), graphs remain full-size & centered
 # =======================================================
 import re
 import socket
@@ -332,10 +330,12 @@ def _percentile_rank_6m(series: Optional[pd.Series]) -> Optional[float]:
     pct = 100.0 * (rank - 1) / (n - 1) if n > 1 else None
     return float(pct) if pct is not None else None
 
-def _daily_vol_bps_6m_pct(series: Optional[pd.Series]) -> Optional[float]:
+def _daily_vol_bps_6m(series: Optional[pd.Series]) -> Optional[float]:
     """
-    Daily volatility in bps over 6M for % levels (RY/BE):
-    std( Δlevel × 100 ), i.e., daily change converted to bps.
+    Daily volatility in bps over 6M:
+    - take daily changes of the level
+    - convert to bps via ×100
+    - std of those changes (≈ annual vol / sqrt(252))
     """
     if series is None: return None
     w = _window_last_6m(series)
@@ -344,18 +344,6 @@ def _daily_vol_bps_6m_pct(series: Optional[pd.Series]) -> Optional[float]:
     d_bps = d_bps.dropna()
     if d_bps.empty: return None
     return float(d_bps.std(ddof=1))
-
-def _daily_vol_bps_6m_iota(series: Optional[pd.Series]) -> Optional[float]:
-    """
-    Daily volatility for Iota over 6M:
-    std( Δlevel ), NO ×100 (Iota already in 'bps-like' units side).
-    """
-    if series is None: return None
-    w = _window_last_6m(series)
-    if w.size < 3: return None
-    d = w.diff().dropna()
-    if d.empty: return None
-    return float(d.std(ddof=1))
 
 def _last_value(series: Optional[pd.Series]) -> Optional[float]:
     if series is None or series.dropna().empty:
@@ -420,10 +408,9 @@ def _build_country_table(country: str) -> Optional[html.Div]:
             "Pct BE (6M)": _fmt(_percentile_rank_6m(be_s), 1),
             "Pct Iota (6M)": _fmt(_percentile_rank_6m(io_s), 1),
 
-            # Vol fix: RY/BE use %→bps (×100), Iota uses raw (no ×100)
-            "Daily Vol RY (bps, 6M)": _fmt(_daily_vol_bps_6m_pct(ry_s), 2),
-            "Daily Vol BE (bps, 6M)": _fmt(_daily_vol_bps_6m_pct(be_s), 2),
-            "Daily Vol Iota (bps, 6M)": _fmt(_daily_vol_bps_6m_iota(io_s), 2),
+            "Daily Vol RY (bps, 6M)": _fmt(_daily_vol_bps_6m(ry_s), 2),
+            "Daily Vol BE (bps, 6M)": _fmt(_daily_vol_bps_6m(be_s), 2),
+            "Daily Vol Iota (bps, 6M)": _fmt(_daily_vol_bps_6m(io_s), 2),
         })
 
     table = dash_table.DataTable(
@@ -467,7 +454,7 @@ def _build_all_country_tables_panel() -> html.Div:
     kids.append(html.Div(
         "Notes: Last = latest available; Sharpe = (last − mean) / stdev over last 6 months (or max available); "
         "Percentile = where the last level sits within the 6M distribution (0..100); "
-        "Daily vol (bps, 6M) = stdev of daily level changes. RY/BE levels are converted to bps (×100); Iota is not.",
+        "Daily vol (bps, 6M) = stdev of daily level changes ×100.",
         style={"fontSize":"11px","color":"#666","marginTop":"8px"}
     ))
     return html.Div(kids)
@@ -557,7 +544,7 @@ def _summary(c1,l1,c2,l2,c3,l3, tab):
     ])
 
 # =========================
-# Render each tab’s static content (tables AFTER graphs)
+# Render each tab’s static content (tables moved AFTER graphs)
 # =========================
 @callback(Output("tab-content","children"),
           Input("active-tab","value"),
@@ -682,7 +669,7 @@ def _build_constructed(metric: str, lookback: str, c1,l1,c2,l2,c3,l3) -> Tuple[O
     return sub, info, title, (y_bps if metric in ["RY","BE"] else "Iota"), comp_series, comp_names
 
 # =========================
-# Callbacks — RY / BE / Iota (tables AFTER graphs)
+# Callbacks — RY / BE / Iota (tables now AFTER graphs)
 # =========================
 @callback(
     Output("ry-fig","figure"), Output("ry-note","children"),
@@ -915,4 +902,3 @@ if __name__ == "__main__":
     try: webbrowser.open(f"http://localhost:{port}")
     except Exception: pass
     app.run_server(host=host, port=port, debug=False)
-
