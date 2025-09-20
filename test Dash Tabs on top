@@ -8,9 +8,8 @@
 # - Regression: last point highlighted; user can pick C1/C2 & tenor
 # - Centered, taller figures; red "Not enough data" flag on ALL tabs
 # - Regression stats: Observations, Beta, Intercept, R², Corr
-# - NEW: Right-side tables (per country) showing last levels & "Sharpe" z-scores
-# - NEW: "Sharpe" = (last − mean) / stdev over last 6M (or max available)
-# - NEW: Components time-series on all 3 metric tabs; regression residuals & components TS
+# - Right-side tables (per country): last levels + Sharpe z-scores (6M)
+# - Components time-series on RY/BE/Iota; Regression residuals + dual-axis components
 # =======================================================
 import re
 import socket
@@ -269,7 +268,7 @@ def figure_timeseries(series: pd.Series, title: str, ylab: str) -> go.Figure:
 def figure_components_ts(series_list: List[pd.Series], names: List[str], title: str, ylab: str) -> go.Figure:
     fig = go.Figure()
     for s, n in zip(series_list, names):
-        if s is None or s.dropna().empty: 
+        if s is None or s.dropna().empty:
             continue
         fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=n))
     fig.update_layout(
@@ -280,14 +279,29 @@ def figure_components_ts(series_list: List[pd.Series], names: List[str], title: 
     )
     return fig
 
-# =============== Sharpe helper (updated to z-score: (last - mean)/std over 6M) ===============
+# Dual-axis components TS for Regression: left = spread (x), right = iota (y)
+def figure_components_ts_dual(x_series: pd.Series, y_series: pd.Series,
+                              x_name: str, y_name: str,
+                              title: str, ylab_left: str, ylab_right: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x_series.index, y=x_series.values, mode="lines", name=x_name, yaxis="y1"
+    ))
+    fig.add_trace(go.Scatter(
+        x=y_series.index, y=y_series.values, mode="lines", name=y_name, yaxis="y2"
+    ))
+    fig.update_layout(
+        title=title, template="plotly_white", height=FIG_HEIGHT,
+        xaxis=dict(title="Date"),
+        yaxis=dict(title=ylab_left, side="left"),
+        yaxis2=dict(title=ylab_right, overlaying="y", side="right", showgrid=False),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    return fig
+
+# =============== Sharpe helper (z-score: (last - mean)/std over 6M) ===============
 def _sharpe_6m_of_levels(series: Optional[pd.Series]) -> Optional[float]:
-    """
-    Z-score style per request:
-      (last_level - mean(levels over last 6M)) / std(levels over last 6M)
-    If <6M of data exist, use the maximum available window. Returns None if
-    there isn't enough variability (std≈0) or data.
-    """
     if series is None or series.dropna().empty:
         return None
     s = series.dropna().sort_index()
@@ -598,8 +612,8 @@ def _build_constructed(metric: str, lookback: str, c1,l1,c2,l2,c3,l3) -> Tuple[O
 # Callbacks — RY / BE / Iota
 # =========================
 @callback(
-    Output("tab_ry-fig","figure", allow_duplicate=True), Output("ry-note","children"),
-    Output("tab_ry-components-fig","figure", allow_duplicate=True),
+    Output("tab_ry-fig","figure"), Output("tab_ry-note","children"),
+    Output("tab_ry-components-fig","figure"),
     Input("active-tab","value"),
     Input("lookback","value"),
     Input("country1","value"), Input("linker1","value"),
@@ -608,8 +622,6 @@ def _build_constructed(metric: str, lookback: str, c1,l1,c2,l2,c3,l3) -> Tuple[O
     prevent_initial_call=False
 )
 def _upd_ry(tab, lookback, c1,l1,c2,l2,c3,l3):
-    # IDs in layout are lowercase (tab id prefix), reconstruct here:
-    fig_id = "tab_ry-fig"; comp_id = "tab_ry-components-fig"  # not used by Dash directly, just clarity
     empty = go.Figure().update_layout(template="plotly_white", height=FIG_HEIGHT)
     if tab != "TAB_RY": return empty, "", empty
     s, info, title, ylab, comps, comp_names = _build_constructed("RY", lookback, c1,l1,c2,l2,c3,l3)
@@ -630,8 +642,8 @@ def _upd_ry(tab, lookback, c1,l1,c2,l2,c3,l3):
     return figure_timeseries(s, title, ylab or "Real Yield"), html.Div(note_children), comp_fig
 
 @callback(
-    Output("tab_be-fig","figure", allow_duplicate=True), Output("be-note","children"),
-    Output("tab_be-components-fig","figure", allow_duplicate=True),
+    Output("tab_be-fig","figure"), Output("tab_be-note","children"),
+    Output("tab_be-components-fig","figure"),
     Input("active-tab","value"),
     Input("lookback","value"),
     Input("country1","value"), Input("linker1","value"),
@@ -660,8 +672,8 @@ def _upd_be(tab, lookback, c1,l1,c2,l2,c3,l3):
     return figure_timeseries(s, title, ylab or "Break-even"), html.Div(note_children), comp_fig
 
 @callback(
-    Output("tab_iota-fig","figure", allow_duplicate=True), Output("iota-note","children"),
-    Output("tab_iota-components-fig","figure", allow_duplicate=True),
+    Output("tab_iota-fig","figure"), Output("tab_iota-note","children"),
+    Output("tab_iota-components-fig","figure"),
     Input("active-tab","value"),
     Input("lookback","value"),
     Input("country1","value"), Input("linker1","value"),
@@ -690,7 +702,7 @@ def _upd_iota(tab, lookback, c1,l1,c2,l2,c3,l3):
     return figure_timeseries(s, title, "Iota"), html.Div(note_children), comp_fig
 
 # =========================
-# Regression (scatter + residuals + components TS)
+# Regression (scatter + residuals + dual-axis components TS)
 # =========================
 @callback(
     Output("reg-fig","figure"),
@@ -711,7 +723,7 @@ def _upd_iota(tab, lookback, c1,l1,c2,l2,c3,l3):
 )
 def _upd_reg(tab, lookback, reg_win_key, rc1, rc2, rtenor, c1,l1,c2,l2,c3,l3):
     empty = go.Figure().update_layout(template="plotly_white", height=FIG_HEIGHT)
-    if tab != "TAB_REG": 
+    if tab != "TAB_REG":
         return empty, "", "", empty, empty
 
     mode = constructed_mode(c1,l1,c2,l2,c3,l3)
@@ -770,7 +782,7 @@ def _upd_reg(tab, lookback, reg_win_key, rc1, rc2, rtenor, c1,l1,c2,l2,c3,l3):
     title = f"REG — {titleI}  ~  Spread {cA}−{cB} {tenor}Y"
     fig = scatter_with_fit_and_last(sub["x"], sub["y"], title, xlab=f"{cA}−{cB} {tenor}Y", ylab=titleI)
 
-    # Stats + residuals
+    # Stats + residuals + dual-axis components TS
     X = sub["x"].values.astype(float); Y = sub["y"].values.astype(float)
     mask = np.isfinite(X) & np.isfinite(Y)
     resid_fig = empty
@@ -796,12 +808,14 @@ def _upd_reg(tab, lookback, reg_win_key, rc1, rc2, rtenor, c1,l1,c2,l2,c3,l3):
         residuals = pd.Series(Y[mask] - yhat, index=sub_valid.index, name="Residuals")
         resid_fig = figure_timeseries(residuals, "Regression residuals (y − ŷ)", "Residual")
 
-        # Components TS: show both variables on same chart
-        comp_fig = figure_components_ts(
-            [sub_valid["x"], sub_valid["y"]],
-            [f"{cA}−{cB} {tenor}Y", titleI],
-            "Regression variables — time series",
-            "Level"
+        # Dual-axis components TS: left=credit spread, right=iota
+        comp_fig = figure_components_ts_dual(
+            sub_valid["x"], sub_valid["y"],
+            x_name=f"{cA}−{cB} {tenor}Y",
+            y_name=titleI,
+            title="Regression variables — time series (dual axis)",
+            ylab_left="Credit spread (bps or level)",
+            ylab_right="Iota"
         )
 
     return fig, html.Div(note_children), stats, resid_fig, comp_fig
