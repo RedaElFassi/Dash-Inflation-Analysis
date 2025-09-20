@@ -10,6 +10,7 @@
 # - Regression stats: Observations, Beta, Intercept, R², Corr
 # - Right-side tables (per country): last levels + Sharpe z-scores (6M)
 # - Components time-series on RY/BE/Iota; Regression residuals + dual-axis components
+# - Page-level horizontal scrolling enabled
 # =======================================================
 import re
 import socket
@@ -59,15 +60,32 @@ MONTHS_MAP = {
     "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12
 }
 
-GRAPH_WRAPPER_STYLE = {"width": "100%"}
+# --- Layout & style ---
+GRAPH_WRAPPER_STYLE = {"width": "72%", "margin": "0 auto"}   # centered figures
 FIG_HEIGHT = 560
 
-RIGHT_PANEL_STYLE = {
-    "width":"28%", "marginLeft":"16px", "maxHeight":"980px",
-    "overflowY":"auto", "border":"1px solid #e9edf5", "borderRadius":"10px", "padding":"8px"
+# Make the whole page horizontally scrollable if content is wider than viewport
+PAGE_WRAPPER_STYLE = {"overflowX": "auto"}
+
+# Wider row to force page-level horizontal scroll when needed
+ROW_STYLE = {
+    "display":"flex",
+    "alignItems":"flex-start",
+    "justifyContent":"space-between",
+    "gap":"16px",
+    "minWidth":"1700px"   # page will scroll horizontally if viewport is narrower
 }
-LEFT_PANEL_STYLE = {"width":"72%"}
-ROW_STYLE = {"display":"flex", "alignItems":"flex-start", "justifyContent":"space-between"}
+
+# Wider left/right panels so tables can breathe
+LEFT_PANEL_STYLE  = {"width":"900px"}        # graphs column
+RIGHT_PANEL_STYLE = {
+    "minWidth":"1100px",  # wide table column to trigger page horizontal scroll
+    "maxHeight":"980px",
+    "overflowY":"auto",
+    "border":"1px solid #e9edf5",
+    "borderRadius":"10px",
+    "padding":"8px"
+}
 
 RED_FLAG_STYLE = {
     "background": "#ffe8e8",
@@ -230,21 +248,17 @@ def scatter_with_fit_and_last(x: pd.Series, y: pd.Series, title: str, xlab: str,
     fig.update_layout(title=title, template="plotly_white", height=FIG_HEIGHT,
                       legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
     fig.update_layout(xaxis_title=xlab, yaxis_title=ylab)
-
     if X.size < 2:
         return fig
-
     if X.size >= 2:
         fig.add_trace(go.Scatter(
             x=X[:-1], y=Y[:-1], mode="markers", name="Obs",
             marker=dict(size=6, opacity=0.85)
         ))
-
     fig.add_trace(go.Scatter(
         x=[X[-1]], y=[Y[-1]], mode="markers", name="Last",
         marker=dict(size=12, color="crimson", line=dict(width=1, color="black"))
     ))
-
     slope, intercept = np.polyfit(X, Y, 1)
     line_x = np.linspace(X.min(), X.max(), 200)
     line_y = slope * line_x + intercept
@@ -279,16 +293,16 @@ def figure_components_ts(series_list: List[pd.Series], names: List[str], title: 
     )
     return fig
 
-# Dual-axis components TS for Regression: left = spread (x), right = iota (y)
-def figure_components_ts_dual(x_series: pd.Series, y_series: pd.Series,
-                              x_name: str, y_name: str,
+# Dual-axis TS utility (generic)
+def figure_components_ts_dual(left_series: pd.Series, right_series: pd.Series,
+                              left_name: str, right_name: str,
                               title: str, ylab_left: str, ylab_right: str) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=x_series.index, y=x_series.values, mode="lines", name=x_name, yaxis="y1"
+        x=left_series.index, y=left_series.values, mode="lines", name=left_name, yaxis="y1"
     ))
     fig.add_trace(go.Scatter(
-        x=y_series.index, y=y_series.values, mode="lines", name=y_name, yaxis="y2"
+        x=right_series.index, y=right_series.values, mode="lines", name=right_name, yaxis="y2"
     ))
     fig.update_layout(
         title=title, template="plotly_white", height=FIG_HEIGHT,
@@ -300,7 +314,7 @@ def figure_components_ts_dual(x_series: pd.Series, y_series: pd.Series,
     )
     return fig
 
-# =============== Sharpe helper (z-score: (last - mean)/std over 6M) ===============
+# =============== Sharpe helper (z-score: (last − mean)/std over 6M) ===============
 def _sharpe_6m_of_levels(series: Optional[pd.Series]) -> Optional[float]:
     if series is None or series.dropna().empty:
         return None
@@ -390,7 +404,7 @@ def _build_country_table(country: str) -> Optional[html.Div]:
         sort_action="native",
         filter_action="native",
         page_action="none",
-        style_table={"overflowX":"auto"},
+        style_table={"minWidth":"1000px", "overflowX":"visible"},  # wide table; let the PAGE scroll
         style_cell={"padding":"6px", "fontSize":"12px"},
         style_header={"backgroundColor":"#f6f8fc","fontWeight":"600"},
         style_as_list_view=True,
@@ -455,7 +469,7 @@ app.layout = html.Div([
         dcc.Tab(label="Regression",  value="TAB_REG"),
     ]),
     html.Div(id="tab-content", style={"marginTop":"10px"}),
-])
+], style=PAGE_WRAPPER_STYLE)
 
 # =========================
 # Dependent dropdowns
@@ -503,15 +517,31 @@ def _summary(c1,l1,c2,l2,c3,l3, tab):
           Input("active-tab","value"),
           State("country1","value"), State("linker1","value"))
 def _render_tab(tab, c1, l1):
-    # Left column per tab
-    if tab in ("TAB_RY", "TAB_BE", "TAB_IOTA"):
+    if tab == "TAB_RY":
         left_col = html.Div([
-            html.Div(id=f"{tab.lower()}-note", style={"margin":"6px 0"}),
-            html.Div(dcc.Graph(id=f"{tab.lower()}-fig", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE),
-            html.Div(dcc.Graph(id=f"{tab.lower()}-components-fig", config={"displaylogo": False}),
-                     style={"marginTop":"8px"})
+            html.Div(id="ry-note", style={"margin":"6px 0"}),
+            html.Div(dcc.Graph(id="ry-fig", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE),
+            html.Div(dcc.Graph(id="ry-components-fig", config={"displaylogo": False}), style={"marginTop":"8px"})
         ], style=LEFT_PANEL_STYLE)
-        right_col = html.Div(_build_all_country_tables_panel(), id=f"{tab.lower()}-tables", style=RIGHT_PANEL_STYLE)
+        right_col = html.Div(_build_all_country_tables_panel(), id="ry-tables", style=RIGHT_PANEL_STYLE)
+        return html.Div([left_col, right_col], style=ROW_STYLE)
+
+    if tab == "TAB_BE":
+        left_col = html.Div([
+            html.Div(id="be-note", style={"margin":"6px 0"}),
+            html.Div(dcc.Graph(id="be-fig", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE),
+            html.Div(dcc.Graph(id="be-components-fig", config={"displaylogo": False}), style={"marginTop":"8px"})
+        ], style=LEFT_PANEL_STYLE)
+        right_col = html.Div(_build_all_country_tables_panel(), id="be-tables", style=RIGHT_PANEL_STYLE)
+        return html.Div([left_col, right_col], style=ROW_STYLE)
+
+    if tab == "TAB_IOTA":
+        left_col = html.Div([
+            html.Div(id="iota-note", style={"margin":"6px 0"}),
+            html.Div(dcc.Graph(id="iota-fig", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE),
+            html.Div(dcc.Graph(id="iota-components-fig", config={"displaylogo": False}), style={"marginTop":"8px"})
+        ], style=LEFT_PANEL_STYLE)
+        right_col = html.Div(_build_all_country_tables_panel(), id="iota-tables", style=RIGHT_PANEL_STYLE)
         return html.Div([left_col, right_col], style=ROW_STYLE)
 
     if tab == "TAB_REG":
@@ -519,6 +549,7 @@ def _render_tab(tab, c1, l1):
         if c1 and l1:
             t = infer_tenor_from_security_name(l1, asof=_today())
             if t in TENORS: tenor_def = t
+        # Only left column, all graphs centered
         left_col = html.Div([
             html.Div([
                 html.Label("Regression window"),
@@ -544,12 +575,12 @@ def _render_tab(tab, c1, l1):
             ], style={"marginBottom":"4px"}),
 
             html.Div(id="reg-note", style={"margin":"6px 0"}),
-            dcc.Graph(id="reg-fig", config={"displaylogo": False}),
-            dcc.Graph(id="reg-resid-fig", config={"displaylogo": False}, style={"marginTop":"8px"}),
-            dcc.Graph(id="reg-components-fig", config={"displaylogo": False}, style={"marginTop":"8px"}),
-            html.Div(id="reg-stats", style={"fontSize":"13px","opacity":0.9,"marginTop":"6px"}),
-        ], style=LEFT_PANEL_STYLE)
-        return html.Div([left_col], style=ROW_STYLE)
+            html.Div(dcc.Graph(id="reg-fig", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE),
+            html.Div(dcc.Graph(id="reg-resid-fig", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE | {"marginTop":"8px"}),
+            html.Div(dcc.Graph(id="reg-components-fig", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE | {"marginTop":"8px"}),
+            html.Div(id="reg-stats", style={"width":"72%","margin":"0 auto","fontSize":"13px","opacity":0.9,"marginTop":"6px"}),
+        ])
+        return html.Div([left_col], style={"display":"block", "minWidth":"1000px"})
 
     return html.Div()
 
@@ -612,8 +643,8 @@ def _build_constructed(metric: str, lookback: str, c1,l1,c2,l2,c3,l3) -> Tuple[O
 # Callbacks — RY / BE / Iota
 # =========================
 @callback(
-    Output("tab_ry-fig","figure"), Output("tab_ry-note","children"),
-    Output("tab_ry-components-fig","figure"),
+    Output("ry-fig","figure"), Output("ry-note","children"),
+    Output("ry-components-fig","figure"),
     Input("active-tab","value"),
     Input("lookback","value"),
     Input("country1","value"), Input("linker1","value"),
@@ -642,8 +673,8 @@ def _upd_ry(tab, lookback, c1,l1,c2,l2,c3,l3):
     return figure_timeseries(s, title, ylab or "Real Yield"), html.Div(note_children), comp_fig
 
 @callback(
-    Output("tab_be-fig","figure"), Output("tab_be-note","children"),
-    Output("tab_be-components-fig","figure"),
+    Output("be-fig","figure"), Output("be-note","children"),
+    Output("be-components-fig","figure"),
     Input("active-tab","value"),
     Input("lookback","value"),
     Input("country1","value"), Input("linker1","value"),
@@ -672,8 +703,8 @@ def _upd_be(tab, lookback, c1,l1,c2,l2,c3,l3):
     return figure_timeseries(s, title, ylab or "Break-even"), html.Div(note_children), comp_fig
 
 @callback(
-    Output("tab_iota-fig","figure"), Output("tab_iota-note","children"),
-    Output("tab_iota-components-fig","figure"),
+    Output("iota-fig","figure"), Output("iota-note","children"),
+    Output("iota-components-fig","figure"),
     Input("active-tab","value"),
     Input("lookback","value"),
     Input("country1","value"), Input("linker1","value"),
@@ -782,7 +813,7 @@ def _upd_reg(tab, lookback, reg_win_key, rc1, rc2, rtenor, c1,l1,c2,l2,c3,l3):
     title = f"REG — {titleI}  ~  Spread {cA}−{cB} {tenor}Y"
     fig = scatter_with_fit_and_last(sub["x"], sub["y"], title, xlab=f"{cA}−{cB} {tenor}Y", ylab=titleI)
 
-    # Stats + residuals + dual-axis components TS
+    # Stats + residuals + dual-axis components TS (Iota LEFT, Spread RIGHT)
     X = sub["x"].values.astype(float); Y = sub["y"].values.astype(float)
     mask = np.isfinite(X) & np.isfinite(Y)
     resid_fig = empty
@@ -808,14 +839,15 @@ def _upd_reg(tab, lookback, reg_win_key, rc1, rc2, rtenor, c1,l1,c2,l2,c3,l3):
         residuals = pd.Series(Y[mask] - yhat, index=sub_valid.index, name="Residuals")
         resid_fig = figure_timeseries(residuals, "Regression residuals (y − ŷ)", "Residual")
 
-        # Dual-axis components TS: left=credit spread, right=iota
+        # Dual-axis components TS with IOTA LEFT, SPREAD RIGHT (as requested)
         comp_fig = figure_components_ts_dual(
-            sub_valid["x"], sub_valid["y"],
-            x_name=f"{cA}−{cB} {tenor}Y",
-            y_name=titleI,
+            left_series=sub_valid["y"],   # Iota on left axis
+            right_series=sub_valid["x"],  # Spread on right axis
+            left_name=titleI,
+            right_name=f"{cA}−{cB} {tenor}Y",
             title="Regression variables — time series (dual axis)",
-            ylab_left="Credit spread (bps or level)",
-            ylab_right="Iota"
+            ylab_left="Iota",
+            ylab_right="Credit spread (bps or level)"
         )
 
     return fig, html.Div(note_children), stats, resid_fig, comp_fig
@@ -843,3 +875,4 @@ if __name__ == "__main__":
     try: webbrowser.open(f"http://localhost:{port}")
     except Exception: pass
     app.run_server(host=host, port=port, debug=False)
+
