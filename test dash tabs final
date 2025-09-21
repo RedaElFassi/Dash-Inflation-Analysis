@@ -3,7 +3,6 @@
 # Linkers Dash — RY / BE / Iota + Regression (EN-only UI)
 # - 4 tabs, clean separation
 # - First 3 tabs: 2 graphs (constructed TS, components TS) + stacked country tables
-# - Graph titles include constructed formula; both graphs clip to chosen lookback
 # - Tables: per-country, rows follow Linker_lists order; 12 columns:
 #   For each metric (RY, BE, Iota): Latest, Z-Score(level), Percentile(6M), Daily Vol
 # - Lookback handling + global red flag when requested > available
@@ -63,7 +62,7 @@ MONTHS_MAP = {
 
 # page-level horizontal scrolling without shrinking figures
 PAGE_WRAPPER_STYLE = {
-    "minWidth": "1800px",
+    "minWidth": "1800px",      # forces horizontal scroll if viewport is narrower
     "padding": "0 16px"
 }
 GRAPH_WRAPPER_STYLE = {"width": "72%", "margin": "0 auto"}   # centered graphs
@@ -92,22 +91,29 @@ def infer_tenor_from_security_name(secname: str, asof: Optional[pd.Timestamp] = 
     """
     Parse common security name patterns to infer maturity date, then map to the
     nearest available tenor from 'asof' (today by default).
-    Supported patterns include: dd-MMM-yyyy, mm/yy or mm/yyyy, 'MMM YY/YYY', and bare 'YYYY'.
+    Supported patterns include:
+      - '11/34', '11/2034'
+      - 'Nov-34', 'NOV 2034', 'NOV34'
+      - '15-May-2026' (or '15-MAY-2026')
+      - '2034'
     """
     if not secname:
         return None
     s = secname.upper()
     asof = asof or _today()
 
+    # 1) dd-MMM-yyyy (e.g., 15-May-2026)
     m = re.search(r'\b(\d{1,2})[-\s]([A-Z]{3})[-\s](\d{4})\b', s)
     if m and m.group(2) in MONTHS_MAP:
         day = int(m.group(1))
         month = MONTHS_MAP[m.group(2)]
         year = int(m.group(3))
         mat = pd.Timestamp(year=year, month=month, day=min(max(day,1),28))
-        yrs = _years_between(asof, mat); yrs = abs(yrs) if yrs < 0 else yrs
+        yrs = _years_between(asof, mat)
+        yrs = abs(yrs) if yrs < 0 else yrs
         return min(TENORS, key=lambda t: abs(t - yrs))
 
+    # 2) mm/yy or mm/yyyy
     m = re.search(r'\b(\d{1,2})\s*/\s*(\d{2,4})\b', s)
     if m:
         mm = int(m.group(1)); yy = int(m.group(2))
@@ -117,6 +123,7 @@ def infer_tenor_from_security_name(secname: str, asof: Optional[pd.Timestamp] = 
         yrs = _years_between(asof, mat); yrs = abs(yrs) if yrs < 0 else yrs
         return min(TENORS, key=lambda t: abs(t - yrs))
 
+    # 3) 'NOV 2034' / 'NOV-34' / 'NOV34'
     m = re.search(r'\b([A-Z]{3})[\s\-]*([0-9]{2,4})\b', s)
     if m and m.group(1) in MONTHS_MAP:
         month = MONTHS_MAP[m.group(1)]
@@ -126,6 +133,7 @@ def infer_tenor_from_security_name(secname: str, asof: Optional[pd.Timestamp] = 
         yrs = _years_between(asof, mat); yrs = abs(yrs) if yrs < 0 else yrs
         return min(TENORS, key=lambda t: abs(t - yrs))
 
+    # 4) '2034'
     m = re.search(r'\b(19|20)\d{2}\b', s)
     if m:
         year = int(m.group(0))
@@ -256,11 +264,13 @@ def figure_timeseries(series: pd.Series, title: str, ylab: str) -> go.Figure:
     )
     return fig
 
-def figure_components(metric: str, lookback: str, c1,l1,c2,l2,c3,l3, constructed_title: str) -> Tuple[go.Figure, Optional[html.Div]]:
+def _components_figure(metric: str, lookback: str,
+                       c1,l1,c2,l2,c3,l3,
+                       constructed_title: str) -> Tuple[go.Figure, Optional[html.Div]]:
     """
     Components TS: outright → 1 line; spread → 2 lines; fly → 3 lines.
-    Units: RY/BE in %, Iota in its unit. All clipped to the same lookback per series.
-    Title includes constructed formula.
+    Units: RY/BE in %, Iota in its unit. Each component is clipped to lookback.
+    Title includes the constructed formula (…)(components).
     """
     mode = constructed_mode(c1,l1,c2,l2,c3,l3)
     s1 = get_linker_series(metric, c1, l1) if c1 and l1 else None
@@ -274,9 +284,8 @@ def figure_components(metric: str, lookback: str, c1,l1,c2,l2,c3,l3, constructed
     fig.update_layout(yaxis_title=ylab, xaxis_title="Date",
                       title=f"{constructed_title} (components)")
 
-    added = 0
     flag = None
-
+    added = 0
     for s, label in [(s1, l1), (s2, l2), (s3, l3)]:
         if s is None: continue
         sub, info = _clip_series_by_lookback(s, lookback)
@@ -398,18 +407,32 @@ def _opt_l3(c):
           Input("active-tab","value"),
           State("country1","value"), State("linker1","value"))
 def _render_tab(tab, c1, l1):
-    if tab in ("TAB_RY", "TAB_BE", "TAB_IOTA"):
-        # graphs + stacked country tables
+    if tab == "TAB_RY":
         return html.Div([
-            html.Div(id=f"{tab}-note", style={"margin":"6px 0"}),
-
-            html.Div(dcc.Graph(id=f"{tab}-fig-constructed", config={"displaylogo": False}),
-                     style=GRAPH_WRAPPER_STYLE),
-
-            html.Div(dcc.Graph(id=f"{tab}-fig-components", config={"displaylogo": False}),
-                     style=GRAPH_WRAPPER_STYLE),
-
-            html.Div(id=f"{tab}-tables", style={"marginTop":"16px"}),
+            html.Div(id="ry-note", style={"margin":"6px 0"}),
+            html.Div(dcc.Graph(id="ry-fig", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE),
+            html.Div(dcc.Graph(id="ry-fig-components", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE),
+            html.Hr(),
+            html.H4("Country tables (Latest, Z-Score 6M, Percentile 6M, Daily Vol)"),
+            html.Div(id="ry-tables", style={"marginTop":"6px"}),
+        ])
+    if tab == "TAB_BE":
+        return html.Div([
+            html.Div(id="be-note", style={"margin":"6px 0"}),
+            html.Div(dcc.Graph(id="be-fig", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE),
+            html.Div(dcc.Graph(id="be-fig-components", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE),
+            html.Hr(),
+            html.H4("Country tables (Latest, Z-Score 6M, Percentile 6M, Daily Vol)"),
+            html.Div(id="be-tables", style={"marginTop":"6px"}),
+        ])
+    if tab == "TAB_IOTA":
+        return html.Div([
+            html.Div(id="iota-note", style={"margin":"6px 0"}),
+            html.Div(dcc.Graph(id="iota-fig", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE),
+            html.Div(dcc.Graph(id="iota-fig-components", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE),
+            html.Hr(),
+            html.H4("Country tables (Latest, Z-Score 6M, Percentile 6M, Daily Vol)"),
+            html.Div(id="iota-tables", style={"marginTop":"6px"}),
         ])
     if tab == "TAB_REG":
         tenor_def = 10
@@ -442,18 +465,63 @@ def _render_tab(tab, c1, l1):
 
             html.Div(id="reg-note", style={"margin":"6px 0"}),
 
-            html.Div(dcc.Graph(id="reg-fig-scatter", config={"displaylogo": False}),
-                     style=GRAPH_WRAPPER_STYLE),
-
-            html.Div(dcc.Graph(id="reg-fig-residuals", config={"displaylogo": False}),
-                     style=GRAPH_WRAPPER_STYLE),
-
-            html.Div(dcc.Graph(id="reg-fig-dual", config={"displaylogo": False}),
-                     style=GRAPH_WRAPPER_STYLE),
+            html.Div(dcc.Graph(id="reg-fig", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE),
+            html.Div(dcc.Graph(id="reg-resid", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE),
+            html.Div(dcc.Graph(id="reg-ts", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE),
 
             html.Div(id="reg-stats", style={"width":"72%","margin":"0 auto","fontSize":"13px","opacity":0.9,"marginTop":"6px"}),
         ])
     return html.Div()
+
+# =========================
+# Constructed series builder (and components)
+# =========================
+def _build_constructed(metric: str, lookback: str, c1,l1,c2,l2,c3,l3) -> Tuple[Optional[pd.Series], Dict[str,Any], str, str]:
+    """
+    Returns (constructed_series, lookback_info, title, y_label)
+    - RY/BE constructed: outright → level (likely %); spread/fly → multiply by 100 to bps for constructed series ONLY
+    - IOTA constructed: no scaling
+    """
+    mode = constructed_mode(c1,l1,c2,l2,c3,l3)
+    s1 = get_linker_series(metric, c1, l1) if c1 and l1 else None
+    s2 = get_linker_series(metric, c2, l2) if c2 and l2 else None
+    s3 = get_linker_series(metric, c3, l3) if c3 and l3 else None
+
+    if metric == "RY":
+        y_out, y_bps = "Real Yield (%)", "Real Yield (bps)"
+    elif metric == "BE":
+        y_out, y_bps = "Break-even (%)", "Break-even (bps)"
+    else:
+        y_out, y_bps = "Iota", "Iota"
+
+    if mode == "outright":
+        if s1 is None or s1.dropna().empty:
+            return None, {}, "", ""
+        sub, info = _clip_series_by_lookback(s1, lookback)
+        title = f"{metric} — {l1}"
+        return sub, info, title, (y_out if metric in ["RY","BE"] else "Iota")
+
+    if mode == "spread":
+        df = align_inner(s1, s2)
+        if df.empty or df.shape[1] < 2:
+            return None, {}, "", ""
+        series = (df.iloc[:,0] - df.iloc[:,1]).rename(f"{metric} Spread: {l1} − {l2}")
+        if metric in ["RY","BE"]:
+            series = series * 100.0
+        sub, info = _clip_series_by_lookback(series, lookback)
+        title = f"{metric} — {l1} − {l2}"
+        return sub, info, title, (y_bps if metric in ["RY","BE"] else "Iota")
+
+    # fly
+    df = align_inner(s1, s2, s3)
+    if df.empty or df.shape[1] < 3:
+        return None, {}, "", ""
+    series = (2.0*df.iloc[:,1] - df.iloc[:,0] - df.iloc[:,2]).rename(f"{metric} Fly: 2×{l2} − {l1} − {l3}")
+    if metric in ["RY","BE"]:
+        series = series * 100.0
+    sub, info = _clip_series_by_lookback(series, lookback)
+    title = f"{metric} — 2×{l2} − {l1} − {l3}"
+    return sub, info, title, (y_bps if metric in ["RY","BE"] else "Iota")
 
 # =========================
 # Table computations (12 columns)
@@ -465,7 +533,7 @@ def _window_for_table(s: pd.Series, months: int = 6) -> pd.Series:
         return s
     end = s.index.max()
     start_req = end - relativedelta(months=months)
-    sub = s.loc[s.index >= max(start_req, s.index.min())]
+    sub = s.loc[s.index >= start_req]
     if len(sub) < 3:
         if len(s) < 3:
             return pd.Series(dtype=float)
@@ -559,7 +627,7 @@ def _tables_block() -> List[html.Div]:
             data=df.to_dict("records"),
             fixed_rows={"headers": True},
             style_table={
-                "minWidth": "1400px",
+                "minWidth": "1400px",  # page handles horizontal scroll
                 "overflowX": "visible"
             },
             style_cell={
@@ -571,7 +639,7 @@ def _tables_block() -> List[html.Div]:
             style_cell_conditional=[
                 {"if": {"column_id": "Linker"},
                  "textAlign": "left",
-                 "minWidth":"160px",    # <<< reduced ~half from 320px
+                 "minWidth":"160px",   # <<< reduced ~half
                  "maxWidth":"160px",
                  "whiteSpace":"nowrap",
                  "textOverflow":"ellipsis"}
@@ -587,22 +655,22 @@ def _update_metric_tab(metric: str, lookback: str,
                        c1,l1,c2,l2,c3,l3):
     empty = go.Figure().update_layout(template="plotly_white", height=FIG_HEIGHT)
 
-    # Constructed
+    # Constructed series
     s, info, title, ylab = _build_constructed(metric, lookback, c1,l1,c2,l2,c3,l3)
     flag = build_red_flag(info)
 
-    # Graph 1 — constructed (title shows constructed formula)
+    # Graph 1 — constructed (title includes constructed series)
     fig_constructed = empty
     if s is not None and not s.empty:
         fig_constructed = figure_timeseries(s, f"{title} (constructed)", ylab or metric)
 
-    # Graph 2 — components (clipped to lookback; title shows constructed formula + '(components)')
+    # Graph 2 — components (each component clipped to lookback; title shows constructed formula)
     mode = constructed_mode(c1,l1,c2,l2,c3,l3)
     formula = constructed_formula(mode, l1, l2, l3)
     comp_title = f"{metric} — {formula}" if formula else metric
-    fig_components, flag_comp = figure_components(metric, lookback, c1,l1,c2,l2,c3,l3, constructed_title=comp_title)
+    fig_components, flag_comp = _components_figure(metric, lookback, c1,l1,c2,l2,c3,l3, constructed_title=comp_title)
 
-    # Note / flags
+    # Notes/flags
     note_children = []
     if flag: note_children.append(flag)
     if flag_comp and flag_comp not in note_children: note_children.append(flag_comp)
@@ -618,10 +686,10 @@ def _update_metric_tab(metric: str, lookback: str,
     return (fig_constructed, fig_components, html.Div(note_children), tables)
 
 @callback(
-    Output("TAB_RY-fig-constructed","figure"),
-    Output("TAB_RY-fig-components","figure"),
-    Output("TAB_RY-note","children"),
-    Output("TAB_RY-tables","children"),
+    Output("ry-fig","figure"),
+    Output("ry-fig-components","figure"),
+    Output("ry-note","children"),
+    Output("ry-tables","children"),
     Input("active-tab","value"),
     Input("lookback","value"),
     Input("country1","value"), Input("linker1","value"),
@@ -629,16 +697,16 @@ def _update_metric_tab(metric: str, lookback: str,
     Input("country3","value"), Input("linker3","value"),
     prevent_initial_call=False
 )
-def _upd_tab_ry(tab, lookback, c1,l1,c2,l2,c3,l3):
+def _upd_ry(tab, lookback, c1,l1,c2,l2,c3,l3):
     if tab != "TAB_RY":
         return go.Figure(), go.Figure(), "", []
     return _update_metric_tab("RY", lookback, c1,l1,c2,l2,c3,l3)
 
 @callback(
-    Output("TAB_BE-fig-constructed","figure"),
-    Output("TAB_BE-fig-components","figure"),
-    Output("TAB_BE-note","children"),
-    Output("TAB_BE-tables","children"),
+    Output("be-fig","figure"),
+    Output("be-fig-components","figure"),
+    Output("be-note","children"),
+    Output("be-tables","children"),
     Input("active-tab","value"),
     Input("lookback","value"),
     Input("country1","value"), Input("linker1","value"),
@@ -646,16 +714,16 @@ def _upd_tab_ry(tab, lookback, c1,l1,c2,l2,c3,l3):
     Input("country3","value"), Input("linker3","value"),
     prevent_initial_call=False
 )
-def _upd_tab_be(tab, lookback, c1,l1,c2,l2,c3,l3):
+def _upd_be(tab, lookback, c1,l1,c2,l2,c3,l3):
     if tab != "TAB_BE":
         return go.Figure(), go.Figure(), "", []
     return _update_metric_tab("BE", lookback, c1,l1,c2,l2,c3,l3)
 
 @callback(
-    Output("TAB_IOTA-fig-constructed","figure"),
-    Output("TAB_IOTA-fig-components","figure"),
-    Output("TAB_IOTA-note","children"),
-    Output("TAB_IOTA-tables","children"),
+    Output("iota-fig","figure"),
+    Output("iota-fig-components","figure"),
+    Output("iota-note","children"),
+    Output("iota-tables","children"),
     Input("active-tab","value"),
     Input("lookback","value"),
     Input("country1","value"), Input("linker1","value"),
@@ -663,18 +731,18 @@ def _upd_tab_be(tab, lookback, c1,l1,c2,l2,c3,l3):
     Input("country3","value"), Input("linker3","value"),
     prevent_initial_call=False
 )
-def _upd_tab_iota(tab, lookback, c1,l1,c2,l2,c3,l3):
+def _upd_iota(tab, lookback, c1,l1,c2,l2,c3,l3):
     if tab != "TAB_IOTA":
         return go.Figure(), go.Figure(), "", []
     return _update_metric_tab("IOTA", lookback, c1,l1,c2,l2,c3,l3)
 
 # =========================
-# Regression (3 graphs, stats; Iota LEFT, Spread RIGHT on dual-axis)
+# Regression (3 graphs; dual axis with Iota LEFT, Spread RIGHT)
 # =========================
 @callback(
-    Output("reg-fig-scatter","figure"),
-    Output("reg-fig-residuals","figure"),
-    Output("reg-fig-dual","figure"),
+    Output("reg-fig","figure"),
+    Output("reg-resid","figure"),
+    Output("reg-ts","figure"),
     Output("reg-note","children"),
     Output("reg-stats","children"),
     Input("active-tab","value"),
@@ -748,18 +816,18 @@ def _upd_reg(tab, lookback, reg_win_key, rc1, rc2, rtenor, c1,l1,c2,l2,c3,l3):
     mask = np.isfinite(X) & np.isfinite(Y)
     slope, intercept = np.polyfit(X[mask], Y[mask], 1)
     yhat = slope * X + intercept
-    resid = pd.Series(Y - yhat, index=sub.index, name="Residuals")
-    fig_resid = figure_timeseries(resid, "Regression residuals (Iota − fitted)", "Residual")
+    resid = pd.Series(Y - yhat, index=sub.index[mask], name="Residuals")
+    fig_resid = figure_timeseries(resid, "Regression residuals (Iota − ŷ)", "Residual")
 
-    # Dual-axis TS: Iota LEFT, Spread RIGHT
-    fig_dual = go.Figure()
-    fig_dual.add_trace(go.Scatter(
+    # Dual-axis TS: Iota LEFT, Credit spread RIGHT
+    fig_ts = go.Figure()
+    fig_ts.add_trace(go.Scatter(
         x=sub.index, y=sub["y"], name="Iota", mode="lines", yaxis="y1"
     ))
-    fig_dual.add_trace(go.Scatter(
+    fig_ts.add_trace(go.Scatter(
         x=sub.index, y=sub["x"], name=f"Spread {cA}-{cB} {tenor}Y (bps)", mode="lines", yaxis="y2"
     ))
-    fig_dual.update_layout(
+    fig_ts.update_layout(
         template="plotly_white", height=FIG_HEIGHT,
         title="Iota (left) vs Credit Spread (right)",
         xaxis=dict(title="Date"),
@@ -781,7 +849,7 @@ def _upd_reg(tab, lookback, reg_win_key, rc1, rc2, rtenor, c1,l1,c2,l2,c3,l3):
             html.Li(f"Corr: {corr:.3f}"),
         ])
 
-    return fig_scatter, fig_resid, fig_dual, html.Div(notes), stats
+    return fig_scatter, fig_resid, fig_ts, html.Div(notes), stats
 
 # =========================
 # Main — launch
