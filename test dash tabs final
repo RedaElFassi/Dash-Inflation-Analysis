@@ -3,6 +3,7 @@
 # Linkers Dash — RY / BE / Iota + Regression (EN-only UI)
 # - 4 tabs, clean separation
 # - First 3 tabs: 2 graphs (constructed TS, components TS) + stacked country tables
+# - Graph titles include constructed formula; both graphs clip to chosen lookback
 # - Tables: per-country, rows follow Linker_lists order; 12 columns:
 #   For each metric (RY, BE, Iota): Latest, Z-Score(level), Percentile(6M), Daily Vol
 # - Lookback handling + global red flag when requested > available
@@ -62,7 +63,7 @@ MONTHS_MAP = {
 
 # page-level horizontal scrolling without shrinking figures
 PAGE_WRAPPER_STYLE = {
-    "minWidth": "1800px",      # forces horizontal scroll if viewport is narrower
+    "minWidth": "1800px",
     "padding": "0 16px"
 }
 GRAPH_WRAPPER_STYLE = {"width": "72%", "margin": "0 auto"}   # centered graphs
@@ -91,29 +92,22 @@ def infer_tenor_from_security_name(secname: str, asof: Optional[pd.Timestamp] = 
     """
     Parse common security name patterns to infer maturity date, then map to the
     nearest available tenor from 'asof' (today by default).
-    Supported patterns include:
-      - '11/34', '11/2034'
-      - 'Nov-34', 'NOV 2034', 'NOV34'
-      - '15-May-2026' (or '15-MAY-2026')
-      - '2034'
+    Supported patterns include: dd-MMM-yyyy, mm/yy or mm/yyyy, 'MMM YY/YYY', and bare 'YYYY'.
     """
     if not secname:
         return None
     s = secname.upper()
     asof = asof or _today()
 
-    # 1) dd-MMM-yyyy (e.g., 15-May-2026)
     m = re.search(r'\b(\d{1,2})[-\s]([A-Z]{3})[-\s](\d{4})\b', s)
     if m and m.group(2) in MONTHS_MAP:
         day = int(m.group(1))
         month = MONTHS_MAP[m.group(2)]
         year = int(m.group(3))
         mat = pd.Timestamp(year=year, month=month, day=min(max(day,1),28))
-        yrs = _years_between(asof, mat)
-        yrs = abs(yrs) if yrs < 0 else yrs
+        yrs = _years_between(asof, mat); yrs = abs(yrs) if yrs < 0 else yrs
         return min(TENORS, key=lambda t: abs(t - yrs))
 
-    # 2) mm/yy or mm/yyyy
     m = re.search(r'\b(\d{1,2})\s*/\s*(\d{2,4})\b', s)
     if m:
         mm = int(m.group(1)); yy = int(m.group(2))
@@ -123,7 +117,6 @@ def infer_tenor_from_security_name(secname: str, asof: Optional[pd.Timestamp] = 
         yrs = _years_between(asof, mat); yrs = abs(yrs) if yrs < 0 else yrs
         return min(TENORS, key=lambda t: abs(t - yrs))
 
-    # 3) 'NOV 2034' / 'NOV-34' / 'NOV34'
     m = re.search(r'\b([A-Z]{3})[\s\-]*([0-9]{2,4})\b', s)
     if m and m.group(1) in MONTHS_MAP:
         month = MONTHS_MAP[m.group(1)]
@@ -133,7 +126,6 @@ def infer_tenor_from_security_name(secname: str, asof: Optional[pd.Timestamp] = 
         yrs = _years_between(asof, mat); yrs = abs(yrs) if yrs < 0 else yrs
         return min(TENORS, key=lambda t: abs(t - yrs))
 
-    # 4) '2034'
     m = re.search(r'\b(19|20)\d{2}\b', s)
     if m:
         year = int(m.group(0))
@@ -176,6 +168,11 @@ def constructed_mode(c1, l1, c2, l2, c3, l3) -> str:
     if all(filled):
         return "fly"
     return "outright"
+
+def constructed_formula(mode: str, l1: Optional[str], l2: Optional[str], l3: Optional[str]) -> str:
+    if mode == "spread" and l1 and l2: return f"{l1} − {l2}"
+    if mode == "fly" and l1 and l2 and l3: return f"2×{l2} − {l1} − {l3}"
+    return l1 or "—"
 
 def _format_years(y: float) -> str:
     if abs(round(y) - y) < 0.05:
@@ -259,19 +256,37 @@ def figure_timeseries(series: pd.Series, title: str, ylab: str) -> go.Figure:
     )
     return fig
 
-def figure_components(components: Dict[str, pd.Series], title: str, ylab: str) -> go.Figure:
-    fig = go.Figure()
-    for name, s in components.items():
-        if s is None or s.dropna().empty:
-            continue
-        fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=name))
-    fig.update_layout(
-        title=title, template="plotly_white", height=FIG_HEIGHT,
-        xaxis_title="Date", yaxis_title=ylab,
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-    return fig
+def figure_components(metric: str, lookback: str, c1,l1,c2,l2,c3,l3, constructed_title: str) -> Tuple[go.Figure, Optional[html.Div]]:
+    """
+    Components TS: outright → 1 line; spread → 2 lines; fly → 3 lines.
+    Units: RY/BE in %, Iota in its unit. All clipped to the same lookback per series.
+    Title includes constructed formula.
+    """
+    mode = constructed_mode(c1,l1,c2,l2,c3,l3)
+    s1 = get_linker_series(metric, c1, l1) if c1 and l1 else None
+    s2 = get_linker_series(metric, c2, l2) if c2 and l2 else None
+    s3 = get_linker_series(metric, c3, l3) if c3 and l3 else None
+
+    fig = go.Figure().update_layout(template="plotly_white", height=FIG_HEIGHT,
+                                    hovermode="x unified",
+                                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    ylab = {"RY":"Real Yield (%)", "BE":"Break-even (%)", "IOTA":"Iota"}.get(metric, metric)
+    fig.update_layout(yaxis_title=ylab, xaxis_title="Date",
+                      title=f"{constructed_title} (components)")
+
+    added = 0
+    flag = None
+
+    for s, label in [(s1, l1), (s2, l2), (s3, l3)]:
+        if s is None: continue
+        sub, info = _clip_series_by_lookback(s, lookback)
+        if added == 0:
+            flag = build_red_flag(info)
+        if sub is None or sub.empty: continue
+        fig.add_trace(go.Scatter(x=sub.index, y=sub.values, mode="lines", name=(label or "series")))
+        added += 1
+
+    return fig, flag
 
 # =========================
 # App
@@ -441,68 +456,6 @@ def _render_tab(tab, c1, l1):
     return html.Div()
 
 # =========================
-# Constructed series builder (and components)
-# =========================
-def _build_constructed(metric: str, lookback: str, c1,l1,c2,l2,c3,l3) -> Tuple[Optional[pd.Series], Dict[str,Any], str, str, Dict[str, pd.Series]]:
-    """
-    Returns (constructed_series, lookback_info, title, y_label, components_dict)
-    - RY/BE constructed: outright → level (likely %); spread/fly → multiply by 100 to bps for constructed series ONLY
-    - IOTA constructed: no scaling
-    - components_dict: raw component series (no ×100), to plot levels for visual context
-    """
-    mode = constructed_mode(c1,l1,c2,l2,c3,l3)
-    s1 = get_linker_series(metric, c1, l1) if c1 and l1 else None
-    s2 = get_linker_series(metric, c2, l2) if c2 and l2 else None
-    s3 = get_linker_series(metric, c3, l3) if c3 and l3 else None
-
-    comps: Dict[str, pd.Series] = {}
-    if s1 is not None: comps[l1] = s1
-    if s2 is not None: comps[l2] = s2
-    if s3 is not None: comps[l3] = s3
-
-    if metric == "RY":
-        y_out, y_bps = "Real Yield (%)", "Real Yield (bps)"
-    elif metric == "BE":
-        y_out, y_bps = "Break-even (%)", "Break-even (bps)"
-    else:
-        y_out, y_bps = "Iota", "Iota"
-
-    if mode == "outright":
-        if s1 is None or s1.dropna().empty:
-            return None, {}, "", "", comps
-        sub, info = _clip_series_by_lookback(s1, lookback)
-        title = f"{metric} — {l1}"
-        return sub, info, title, (y_out if metric in ["RY","BE"] else "Iota"), comps
-
-    if mode == "spread":
-        df = align_inner(s1, s2)
-        if df.empty or df.shape[1] < 2:
-            return None, {}, "", "", comps
-        series = (df.iloc[:,0] - df.iloc[:,1]).rename(f"{metric} Spread: {l1} − {l2}")
-        if metric in ["RY","BE"]:
-            series = series * 100.0
-            ylab = y_bps
-        else:
-            ylab = "Iota"
-        sub, info = _clip_series_by_lookback(series, lookback)
-        title = f"{metric} — {l1} − {l2}"
-        return sub, info, title, ylab, comps
-
-    # fly
-    df = align_inner(s1, s2, s3)
-    if df.empty or df.shape[1] < 3:
-        return None, {}, "", "", comps
-    series = (2.0*df.iloc[:,1] - df.iloc[:,0] - df.iloc[:,2]).rename(f"{metric} Fly: 2×{l2} − {l1} − {l3}")
-    if metric in ["RY","BE"]:
-        series = series * 100.0
-        ylab = y_bps
-    else:
-        ylab = "Iota"
-    sub, info = _clip_series_by_lookback(series, lookback)
-    title = f"{metric} — 2×{l2} − {l1} − {l3}"
-    return sub, info, title, ylab, comps
-
-# =========================
 # Table computations (12 columns)
 # =========================
 def _window_for_table(s: pd.Series, months: int = 6) -> pd.Series:
@@ -512,7 +465,7 @@ def _window_for_table(s: pd.Series, months: int = 6) -> pd.Series:
         return s
     end = s.index.max()
     start_req = end - relativedelta(months=months)
-    sub = s.loc[s.index >= start_req]
+    sub = s.loc[s.index >= max(start_req, s.index.min())]
     if len(sub) < 3:
         if len(s) < 3:
             return pd.Series(dtype=float)
@@ -606,7 +559,7 @@ def _tables_block() -> List[html.Div]:
             data=df.to_dict("records"),
             fixed_rows={"headers": True},
             style_table={
-                "minWidth": "1400px",  # encourage horizontal scroll at page-level if needed
+                "minWidth": "1400px",
                 "overflowX": "visible"
             },
             style_cell={
@@ -615,7 +568,14 @@ def _tables_block() -> List[html.Div]:
                 "textAlign": "right"
             },
             style_header={"fontWeight": "700", "textAlign":"right"},
-            style_cell_conditional=[{"if": {"column_id": "Linker"}, "textAlign": "left", "minWidth":"320px"}],
+            style_cell_conditional=[
+                {"if": {"column_id": "Linker"},
+                 "textAlign": "left",
+                 "minWidth":"160px",    # <<< reduced ~half from 320px
+                 "maxWidth":"160px",
+                 "whiteSpace":"nowrap",
+                 "textOverflow":"ellipsis"}
+            ],
             page_size=9999
         ))
     return blocks
@@ -623,25 +583,29 @@ def _tables_block() -> List[html.Div]:
 # =========================
 # Callbacks — RY / BE / Iota (graphs + tables)
 # =========================
-def _update_metric_tab(tab_key: str, metric: str, lookback: str,
+def _update_metric_tab(metric: str, lookback: str,
                        c1,l1,c2,l2,c3,l3):
     empty = go.Figure().update_layout(template="plotly_white", height=FIG_HEIGHT)
 
-    s, info, title, ylab, comps = _build_constructed(metric, lookback, c1,l1,c2,l2,c3,l3)
+    # Constructed
+    s, info, title, ylab = _build_constructed(metric, lookback, c1,l1,c2,l2,c3,l3)
     flag = build_red_flag(info)
 
-    # constructed series figure
+    # Graph 1 — constructed (title shows constructed formula)
     fig_constructed = empty
     if s is not None and not s.empty:
-        fig_constructed = figure_timeseries(s, f"{metric} — Constructed", ylab or metric)
+        fig_constructed = figure_timeseries(s, f"{title} (constructed)", ylab or metric)
 
-    # components figure (raw components, if any)
-    fig_components = empty
-    if comps:
-        fig_components = figure_components(comps, f"{metric} — Components", "Level")
+    # Graph 2 — components (clipped to lookback; title shows constructed formula + '(components)')
+    mode = constructed_mode(c1,l1,c2,l2,c3,l3)
+    formula = constructed_formula(mode, l1, l2, l3)
+    comp_title = f"{metric} — {formula}" if formula else metric
+    fig_components, flag_comp = figure_components(metric, lookback, c1,l1,c2,l2,c3,l3, constructed_title=comp_title)
 
+    # Note / flags
     note_children = []
     if flag: note_children.append(flag)
+    if flag_comp and flag_comp not in note_children: note_children.append(flag_comp)
     if s is not None and not s.empty and all(k in info for k in ["requested_years","available_years","used_years"]):
         note_children.append(html.Div(
             f"Requested≈{_format_years(info['requested_years'])} | "
@@ -668,7 +632,7 @@ def _update_metric_tab(tab_key: str, metric: str, lookback: str,
 def _upd_tab_ry(tab, lookback, c1,l1,c2,l2,c3,l3):
     if tab != "TAB_RY":
         return go.Figure(), go.Figure(), "", []
-    return _update_metric_tab("TAB_RY", "RY", lookback, c1,l1,c2,l2,c3,l3)
+    return _update_metric_tab("RY", lookback, c1,l1,c2,l2,c3,l3)
 
 @callback(
     Output("TAB_BE-fig-constructed","figure"),
@@ -685,7 +649,7 @@ def _upd_tab_ry(tab, lookback, c1,l1,c2,l2,c3,l3):
 def _upd_tab_be(tab, lookback, c1,l1,c2,l2,c3,l3):
     if tab != "TAB_BE":
         return go.Figure(), go.Figure(), "", []
-    return _update_metric_tab("TAB_BE", "BE", lookback, c1,l1,c2,l2,c3,l3)
+    return _update_metric_tab("BE", lookback, c1,l1,c2,l2,c3,l3)
 
 @callback(
     Output("TAB_IOTA-fig-constructed","figure"),
@@ -702,7 +666,7 @@ def _upd_tab_be(tab, lookback, c1,l1,c2,l2,c3,l3):
 def _upd_tab_iota(tab, lookback, c1,l1,c2,l2,c3,l3):
     if tab != "TAB_IOTA":
         return go.Figure(), go.Figure(), "", []
-    return _update_metric_tab("TAB_IOTA", "IOTA", lookback, c1,l1,c2,l2,c3,l3)
+    return _update_metric_tab("IOTA", lookback, c1,l1,c2,l2,c3,l3)
 
 # =========================
 # Regression (3 graphs, stats; Iota LEFT, Spread RIGHT on dual-axis)
@@ -732,7 +696,7 @@ def _upd_reg(tab, lookback, reg_win_key, rc1, rc2, rtenor, c1,l1,c2,l2,c3,l3):
     mode = constructed_mode(c1,l1,c2,l2,c3,l3)
 
     # Y: constructed Iota (respect lookback)
-    sI, infoI, titleI, _, _ = _build_constructed("IOTA", lookback, c1,l1,c2,l2,c3,l3)
+    sI, infoI, titleI, _ = _build_constructed("IOTA", lookback, c1,l1,c2,l2,c3,l3)
     if sI is None or sI.empty:
         return empty, empty, empty, html.Div("Iota unavailable after filtering.", style=DETAIL_NOTE_STYLE), ""
 
@@ -777,7 +741,7 @@ def _upd_reg(tab, lookback, reg_win_key, rc1, rc2, rtenor, c1,l1,c2,l2,c3,l3):
     # Scatter with fit + last highlighted
     title_scatter = f"Regression — {titleI}  ~  Spread {cA}−{cB} {tenor}Y"
     fig_scatter = scatter_with_fit_and_last(sub["x"], sub["y"], title_scatter,
-                                            xlab=f"{cA}−{cB} {tenor}Y (bps)", ylab="Iota")
+                                            xlab=f"{cA}−{cB} {tenor}Y (bps)", ylab=titleI)
 
     # Residuals
     X = sub["x"].values.astype(float); Y = sub["y"].values.astype(float)
